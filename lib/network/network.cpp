@@ -179,17 +179,38 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     memcpy(reqBuf + pos, fb->buf, fb->len); pos += fb->len;
     memcpy(reqBuf + pos, tail.c_str(), tail.length()); pos += tail.length();
 
-    Serial.printf("[Network] Sending %u bytes in single write...\n", totalLen);
+    Serial.printf("[Network] Sending %u bytes...\n", totalLen);
 
-    // Single write — pushes everything into the TCP send buffer at once
-    size_t written = client.write(reqBuf, totalLen);
-    free(reqBuf);
+    // Send in chunks with delays for TCP ACK processing.
+    // The GDMA corruption means lwIP's ACK handling is degraded —
+    // give it generous time between writes to drain the send buffer.
+    size_t sent = 0;
+    const size_t chunkSize = 4096;
+    int stallCount = 0;
+    while (sent < totalLen) {
+        size_t toSend = totalLen - sent;
+        if (toSend > chunkSize) toSend = chunkSize;
 
-    if (written != totalLen) {
-        Serial.printf("[Network] Write incomplete: %u/%u bytes\n", written, totalLen);
-        client.stop();
-        return -1;
+        size_t written = client.write(reqBuf + sent, toSend);
+        if (written > 0) {
+            sent += written;
+            stallCount = 0;
+            // Give lwIP time to actually send the data and process ACKs
+            delay(50);
+            yield();
+        } else {
+            stallCount++;
+            if (stallCount > 20) {  // 20 * 100ms = 2s stall
+                Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, totalLen);
+                free(reqBuf);
+                client.stop();
+                return -1;
+            }
+            delay(100);
+            yield();
+        }
     }
+    free(reqBuf);
 
     client.flush();
     Serial.printf("[Network] Sent %u bytes, waiting for response...\n", totalLen);
