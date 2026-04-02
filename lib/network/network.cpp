@@ -1,5 +1,7 @@
 #include "network.h"
 #include <WiFi.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 
 // Boot count from main.cpp (RTC_DATA_ATTR)
 extern RTC_DATA_ATTR uint32_t bootCount;
@@ -99,21 +101,40 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // Open fresh TCP connection
-    WiFiClient client;
+    // Use raw lwIP socket with non-blocking writes.
+    // Arduino WiFiClient.write() blocks forever when the TCP send buffer
+    // fills, and the GDMA-corrupted lwIP can't drain it. With raw sockets
+    // + MSG_DONTWAIT, write returns EAGAIN instead of blocking.
 
     IPAddress serverIP;
     serverIP.fromString(SERVER_HOST);
 
+    int sock = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        Serial.printf("[Network] socket() failed: %d\n", errno);
+        return -1;
+    }
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(SERVER_PORT);
+    dest.sin_addr.s_addr = (uint32_t)serverIP;
+
+    // Set connect timeout via SO_RCVTIMEO (connect uses it internally)
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    lwip_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     Serial.printf("[Network] Connecting TCP to %s:%d...\n", SERVER_HOST, SERVER_PORT);
-    if (!client.connect(serverIP, SERVER_PORT, 5000)) {
+    if (lwip_connect(sock, (struct sockaddr*)&dest, sizeof(dest)) != 0) {
         Serial.printf("[Network] TCP connect failed (errno %d)\n", errno);
+        lwip_close(sock);
         return -1;
     }
     Serial.println("[Network] TCP connected");
-
-    // Set short write timeout so we don't block forever when send buffer fills
-    client.setTimeout(2);
 
     // Collect ESP stats
     int8_t rssi = WiFi.RSSI();
@@ -147,7 +168,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     };
     int numFields = sizeof(fields) / sizeof(fields[0]);
 
-    // Pre-build multipart body prefix (metadata + image header)
+    // Pre-build multipart body
     String meta;
     meta.reserve(2048);
     for (int i = 0; i < numFields; i++) {
@@ -163,7 +184,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     String tail = "\r\n--" + boundary + "--\r\n";
     size_t bodyLen = meta.length() + fb->len + tail.length();
 
-    // Build HTTP request line + headers
+    // Build HTTP headers
     String headers;
     headers.reserve(256);
     headers += "POST ";
@@ -178,16 +199,14 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     headers += String(bodyLen);
     headers += "\r\nConnection: close\r\n\r\n";
 
-    // Assemble ENTIRE HTTP request (headers + body) in one PSRAM buffer.
-    // This lets us do a single write() call — critical because the ESP32-S3
-    // GDMA corruption means lwIP can't process TCP ACKs between write calls.
+    // Assemble entire request in PSRAM
     size_t totalLen = headers.length() + bodyLen;
     Serial.printf("[Network] Assembling %u byte request in PSRAM...\n", totalLen);
 
     uint8_t* reqBuf = (uint8_t*)ps_malloc(totalLen);
     if (!reqBuf) {
-        Serial.println("[Network] PSRAM alloc failed for request buffer");
-        client.stop();
+        Serial.println("[Network] PSRAM alloc failed");
+        lwip_close(sock);
         return -1;
     }
 
@@ -197,73 +216,78 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     memcpy(reqBuf + pos, fb->buf, fb->len); pos += fb->len;
     memcpy(reqBuf + pos, tail.c_str(), tail.length()); pos += tail.length();
 
-    Serial.printf("[Network] Sending %u bytes...\n", totalLen);
+    Serial.printf("[Network] Sending %u bytes via raw lwIP socket...\n", totalLen);
 
-    // Send in chunks with delays for TCP ACK processing.
-    // The GDMA corruption means lwIP's ACK handling is degraded —
-    // give it generous time between writes to drain the send buffer.
+    // Non-blocking send loop
     size_t sent = 0;
-    const size_t chunkSize = 2048;
     int stallCount = 0;
     unsigned long sendStart = millis();
     while (sent < totalLen) {
         size_t toSend = totalLen - sent;
-        if (toSend > chunkSize) toSend = chunkSize;
+        if (toSend > 2048) toSend = 2048;
 
-        size_t written = client.write(reqBuf + sent, toSend);
+        int written = lwip_send(sock, reqBuf + sent, toSend, MSG_DONTWAIT);
         if (written > 0) {
             sent += written;
             stallCount = 0;
-            if (sent % 16384 < chunkSize) {
+            if (sent % 16384 < 2048) {
                 Serial.printf("[Network]   %u/%u bytes (%.0f%%)\n",
                               sent, totalLen, 100.0 * sent / totalLen);
             }
-            // Generous delay to let lwIP process ACKs
-            delay(100);
+            delay(20);
             yield();
-        } else {
+        } else if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             stallCount++;
-            if (stallCount > 100) {  // 100 * 200ms = 20s total stall
-                Serial.printf("[Network] Write stalled at %u/%u bytes after %lums\n",
-                              sent, totalLen, millis() - sendStart);
+            if (stallCount > 150) {  // 150 * 200ms = 30s stall
+                Serial.printf("[Network] Write stalled at %u/%u bytes (EAGAIN x%d, %lums)\n",
+                              sent, totalLen, stallCount, millis() - sendStart);
                 free(reqBuf);
-                client.stop();
+                lwip_close(sock);
                 return -1;
             }
-            // Long delay to give lwIP maximum time to drain
             delay(200);
             yield();
+        } else {
+            Serial.printf("[Network] Write error at %u/%u bytes (ret=%d, errno=%d)\n",
+                          sent, totalLen, written, errno);
+            free(reqBuf);
+            lwip_close(sock);
+            return -1;
         }
     }
     free(reqBuf);
-    Serial.printf("[Network] Upload took %lu ms\n", millis() - sendStart);
-
-    client.flush();
-    Serial.printf("[Network] Sent %u bytes, waiting for response...\n", totalLen);
+    Serial.printf("[Network] Upload sent in %lu ms\n", millis() - sendStart);
 
     // Read response
+    char respBuf[256];
     unsigned long respStart = millis();
-    while (!client.available() && millis() - respStart < UPLOAD_TIMEOUT_MS) {
-        delay(10);
+    int respLen = 0;
+    while (millis() - respStart < UPLOAD_TIMEOUT_MS) {
+        int r = lwip_recv(sock, respBuf + respLen, sizeof(respBuf) - respLen - 1, MSG_DONTWAIT);
+        if (r > 0) {
+            respLen += r;
+            respBuf[respLen] = '\0';
+            if (strstr(respBuf, "\r\n")) break;  // Got status line
+        } else if (r == 0) {
+            break;  // Connection closed
+        }
+        delay(50);
     }
 
     int httpCode = -1;
-    if (client.available()) {
-        String statusLine = client.readStringUntil('\n');
-        int space1 = statusLine.indexOf(' ');
-        if (space1 > 0) {
-            httpCode = statusLine.substring(space1 + 1, space1 + 4).toInt();
-        }
-        // Drain remaining response
-        while (client.available()) {
-            client.read();
+    if (respLen > 0) {
+        respBuf[respLen] = '\0';
+        // Parse "HTTP/1.1 200 OK"
+        char* space = strchr(respBuf, ' ');
+        if (space) {
+            httpCode = atoi(space + 1);
         }
         Serial.printf("[Network] HTTP %d\n", httpCode);
     } else {
         Serial.println("[Network] No response (timeout)");
     }
 
-    client.stop();
+    lwip_close(sock);
     return httpCode;
 }
 
