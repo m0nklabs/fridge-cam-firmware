@@ -19,48 +19,63 @@ static const KnownAP knownAPs[] = {
 static const int numKnownAPs = sizeof(knownAPs) / sizeof(knownAPs[0]);
 
 bool networkConnect() {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+    // Try connecting up to 3 times with full WiFi reset between attempts
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            Serial.printf("[Network] WiFi retry %d/3 — full radio reset\n", attempt + 1);
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            delay(500);
+        }
 
-    Serial.println("[Network] Scanning...");
-    int n = WiFi.scanNetworks();
+        WiFi.mode(WIFI_STA);
+        delay(100);
 
-    int bestIdx = -1;
-    int bestRSSI = -999;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < numKnownAPs; j++) {
-            if (strlen(knownAPs[j].ssid) > 0 && WiFi.SSID(i) == knownAPs[j].ssid) {
-                Serial.printf("[Network]   %s: %d dBm\n", knownAPs[j].ssid, WiFi.RSSI(i));
-                if (WiFi.RSSI(i) > bestRSSI) {
-                    bestRSSI = WiFi.RSSI(i);
-                    bestIdx = j;
+        Serial.println("[Network] Scanning...");
+        int n = WiFi.scanNetworks();
+
+        int bestIdx = -1;
+        int bestRSSI = -999;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < numKnownAPs; j++) {
+                if (strlen(knownAPs[j].ssid) > 0 && WiFi.SSID(i) == knownAPs[j].ssid) {
+                    Serial.printf("[Network]   %s: %d dBm\n", knownAPs[j].ssid, WiFi.RSSI(i));
+                    if (WiFi.RSSI(i) > bestRSSI) {
+                        bestRSSI = WiFi.RSSI(i);
+                        bestIdx = j;
+                    }
                 }
             }
         }
-    }
-    WiFi.scanDelete();
+        WiFi.scanDelete();
 
-    if (bestIdx < 0) {
-        Serial.println("[Network] No known AP found");
-        return false;
-    }
-
-    Serial.printf("[Network] Connecting to %s (%d dBm)", knownAPs[bestIdx].ssid, bestRSSI);
-    WiFi.begin(knownAPs[bestIdx].ssid, knownAPs[bestIdx].pass);
-
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - start > WIFI_TIMEOUT_MS) {
-            Serial.printf(" TIMEOUT (status=%d)\n", WiFi.status());
-            return false;
+        if (bestIdx < 0) {
+            Serial.println("[Network] No known AP found");
+            continue;
         }
-        delay(250);
-        Serial.printf("[%d]", WiFi.status());
+
+        Serial.printf("[Network] Connecting to %s (%d dBm)", knownAPs[bestIdx].ssid, bestRSSI);
+        WiFi.begin(knownAPs[bestIdx].ssid, knownAPs[bestIdx].pass);
+
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            if (millis() - start > WIFI_TIMEOUT_MS) {
+                Serial.printf(" TIMEOUT (status=%d)\n", WiFi.status());
+                break;
+            }
+            delay(250);
+            Serial.printf("[%d]", WiFi.status());
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf(" OK (%s, RSSI: %d dBm)\n",
+                          WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            return true;
+        }
     }
-    Serial.printf(" OK (%s, RSSI: %d dBm)\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    return true;
+
+    Serial.println("[Network] All WiFi attempts failed");
+    return false;
 }
 
 void networkDisconnect() {
