@@ -101,208 +101,131 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // Use raw lwIP socket with non-blocking writes.
-    // Arduino WiFiClient.write() blocks forever when the TCP send buffer
-    // fills, and the GDMA-corrupted lwIP can't drain it. With raw sockets
-    // + MSG_DONTWAIT, write returns EAGAIN instead of blocking.
+    // UDP upload — bypasses broken lwIP TCP task after GDMA corruption.
+    // Protocol: 6-byte header per packet + payload.
+    // Chunk 0 = JSON metadata, chunks 1..N = raw JPEG data.
 
-    IPAddress serverIP;
-    serverIP.fromString(SERVER_HOST);
+    const int MAX_PAYLOAD = 1466;  // 1472 MTU - 6 byte header
+    const int HEADER_SIZE = 6;
 
-    int sock = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    // Create UDP socket
+    int sock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        Serial.printf("[Network] socket() failed: %d\n", errno);
+        Serial.printf("[Network] UDP socket() failed: %d\n", errno);
         return -1;
     }
 
     struct sockaddr_in dest;
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(SERVER_PORT);
+    dest.sin_port = htons(UDP_PORT);
+    IPAddress serverIP;
+    serverIP.fromString(SERVER_HOST);
     dest.sin_addr.s_addr = (uint32_t)serverIP;
 
-    // Set connect timeout via SO_RCVTIMEO (connect uses it internally)
-    struct timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 0;
-    lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    lwip_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // Random session ID to group packets
+    uint16_t sessionId = (uint16_t)(esp_random() & 0xFFFF);
 
-    Serial.printf("[Network] Connecting TCP to %s:%d...\n", SERVER_HOST, SERVER_PORT);
-    if (lwip_connect(sock, (struct sockaddr*)&dest, sizeof(dest)) != 0) {
-        Serial.printf("[Network] TCP connect failed (errno %d)\n", errno);
-        lwip_close(sock);
-        return -1;
-    }
-    Serial.println("[Network] TCP connected");
-
-    // Collect ESP stats
+    // Build JSON metadata for chunk 0
     int8_t rssi = WiFi.RSSI();
-    uint32_t freeHeap = ESP.getFreeHeap();
-    uint32_t freePsram = ESP.getFreePsram();
-    uint32_t uptimeMs = millis();
-    esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
+    char metaJson[512];
+    int metaLen = snprintf(metaJson, sizeof(metaJson),
+        "{\"camera_id\":\"%s\",\"zone\":\"%s\",\"frame_seq\":%u,"
+        "\"battery_mv\":%u,\"battery_pct\":%u,\"wifi_rssi\":%d,"
+        "\"wifi_ssid\":\"%s\",\"free_heap\":%u,\"free_psram\":%u,"
+        "\"boot_count\":%u,\"uptime_ms\":%lu,\"wake_reason\":%d,"
+        "\"fw_version\":\"0.2.0-udp\",\"frame_width\":%u,"
+        "\"frame_height\":%u,\"frame_bytes\":%u}",
+        CAMERA_ID, ZONE, frameSeq,
+        batteryMV, batteryPct, rssi,
+        WiFi.SSID().c_str(), ESP.getFreeHeap(), ESP.getFreePsram(),
+        bootCount, millis(), (int)esp_sleep_get_wakeup_cause(),
+        fb->width, fb->height, fb->len);
 
-    String boundary = "----FridgeCam";
+    // Calculate total chunks: 1 (metadata) + ceil(jpeg_len / MAX_PAYLOAD)
+    uint16_t jpegChunks = (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
+    uint16_t totalChunks = 1 + jpegChunks;
 
-    // Build metadata fields
-    struct Field { const char* name; String value; };
-    Field fields[] = {
-        {"camera_id",    CAMERA_ID},
-        {"zone",         ZONE},
-        {"frame_seq",    String(frameSeq)},
-        {"battery_mv",   String(batteryMV)},
-        {"battery_pct",  String(batteryPct)},
-        {"wifi_rssi",    String(rssi)},
-        {"wifi_ssid",    WiFi.SSID()},
-        {"free_heap",    String(freeHeap)},
-        {"free_psram",   String(freePsram)},
-        {"boot_count",   String(bootCount)},
-        {"uptime_ms",    String(uptimeMs)},
-        {"wake_reason",  String((int)wakeReason)},
-        {"capture_ms",   String(uptimeMs)},
-        {"fw_version",   "0.1.1"},
-        {"frame_width",  String(fb->width)},
-        {"frame_height", String(fb->height)},
-        {"frame_bytes",  String(fb->len)},
+    Serial.printf("[Network] UDP upload: session=0x%04X, %u bytes JPEG, %u chunks\n",
+                  sessionId, fb->len, totalChunks);
+
+    // Packet buffer (header + payload)
+    uint8_t pkt[HEADER_SIZE + MAX_PAYLOAD];
+
+    // Helper to fill header
+    auto fillHeader = [&](uint16_t chunkIdx) {
+        pkt[0] = (sessionId >> 8) & 0xFF;
+        pkt[1] = sessionId & 0xFF;
+        pkt[2] = (chunkIdx >> 8) & 0xFF;
+        pkt[3] = chunkIdx & 0xFF;
+        pkt[4] = (totalChunks >> 8) & 0xFF;
+        pkt[5] = totalChunks & 0xFF;
     };
-    int numFields = sizeof(fields) / sizeof(fields[0]);
 
-    // Pre-build multipart body
-    String meta;
-    meta.reserve(2048);
-    for (int i = 0; i < numFields; i++) {
-        meta += "--" + boundary + "\r\n";
-        meta += "Content-Disposition: form-data; name=\"" + String(fields[i].name) + "\"\r\n\r\n";
-        meta += fields[i].value + "\r\n";
-    }
-    meta += "--" + boundary + "\r\n";
-    meta += "Content-Disposition: form-data; name=\"image\"; filename=\"";
-    meta += CAMERA_ID;
-    meta += ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    int chunksSent = 0;
 
-    String tail = "\r\n--" + boundary + "--\r\n";
-    size_t bodyLen = meta.length() + fb->len + tail.length();
-
-    // Build HTTP headers
-    String headers;
-    headers.reserve(256);
-    headers += "POST ";
-    headers += SERVER_PATH;
-    headers += " HTTP/1.1\r\nHost: ";
-    headers += SERVER_HOST;
-    headers += ":";
-    headers += String(SERVER_PORT);
-    headers += "\r\nContent-Type: multipart/form-data; boundary=";
-    headers += boundary;
-    headers += "\r\nContent-Length: ";
-    headers += String(bodyLen);
-    headers += "\r\nConnection: close\r\n\r\n";
-
-    // Assemble entire request in PSRAM
-    size_t totalLen = headers.length() + bodyLen;
-    Serial.printf("[Network] Assembling %u byte request in PSRAM...\n", totalLen);
-
-    uint8_t* reqBuf = (uint8_t*)ps_malloc(totalLen);
-    if (!reqBuf) {
-        Serial.println("[Network] PSRAM alloc failed");
+    // Send chunk 0: metadata JSON
+    fillHeader(0);
+    memcpy(pkt + HEADER_SIZE, metaJson, metaLen);
+    int sent = lwip_sendto(sock, pkt, HEADER_SIZE + metaLen, 0,
+                           (struct sockaddr*)&dest, sizeof(dest));
+    if (sent < 0) {
+        Serial.printf("[Network] UDP send meta failed: errno=%d\n", errno);
         lwip_close(sock);
         return -1;
     }
+    chunksSent++;
+    delay(2);  // Small gap to avoid overwhelming receiver
 
-    size_t pos = 0;
-    memcpy(reqBuf + pos, headers.c_str(), headers.length()); pos += headers.length();
-    memcpy(reqBuf + pos, meta.c_str(), meta.length()); pos += meta.length();
-    memcpy(reqBuf + pos, fb->buf, fb->len); pos += fb->len;
-    memcpy(reqBuf + pos, tail.c_str(), tail.length()); pos += tail.length();
+    // Send chunks 1..N: JPEG data
+    size_t offset = 0;
+    for (uint16_t i = 1; i < totalChunks; i++) {
+        size_t payloadLen = fb->len - offset;
+        if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
 
-    Serial.printf("[Network] Sending %u bytes via raw lwIP socket...\n", totalLen);
+        fillHeader(i);
+        memcpy(pkt + HEADER_SIZE, fb->buf + offset, payloadLen);
 
-    // Non-blocking send loop
-    size_t sent = 0;
-    int stallCount = 0;
-    unsigned long sendStart = millis();
-    while (sent < totalLen) {
-        size_t toSend = totalLen - sent;
-        if (toSend > 2048) toSend = 2048;
-
-        int written = lwip_send(sock, reqBuf + sent, toSend, MSG_DONTWAIT);
-        if (written > 0) {
-            sent += written;
-            stallCount = 0;
-            if (sent % 16384 < 2048) {
-                Serial.printf("[Network]   %u/%u bytes (%.0f%%)\n",
-                              sent, totalLen, 100.0 * sent / totalLen);
-            }
-            delay(20);
-            yield();
-        } else if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            stallCount++;
-            if (stallCount > 150) {  // 150 * 200ms = 30s stall
-                Serial.printf("[Network] Write stalled at %u/%u bytes (EAGAIN x%d, %lums)\n",
-                              sent, totalLen, stallCount, millis() - sendStart);
-                free(reqBuf);
-                lwip_close(sock);
-                return -1;
-            }
-            delay(200);
-            yield();
+        sent = lwip_sendto(sock, pkt, HEADER_SIZE + payloadLen, 0,
+                           (struct sockaddr*)&dest, sizeof(dest));
+        if (sent < 0) {
+            Serial.printf("[Network] UDP send chunk %u failed: errno=%d\n", i, errno);
+            // Continue — UDP is lossy, server can handle gaps
         } else {
-            Serial.printf("[Network] Write error at %u/%u bytes (ret=%d, errno=%d)\n",
-                          sent, totalLen, written, errno);
-            free(reqBuf);
-            lwip_close(sock);
-            return -1;
+            chunksSent++;
         }
-    }
-    free(reqBuf);
-    Serial.printf("[Network] Upload sent in %lu ms\n", millis() - sendStart);
 
-    // Read response
-    char respBuf[256];
-    unsigned long respStart = millis();
-    int respLen = 0;
-    while (millis() - respStart < UPLOAD_TIMEOUT_MS) {
-        int r = lwip_recv(sock, respBuf + respLen, sizeof(respBuf) - respLen - 1, MSG_DONTWAIT);
-        if (r > 0) {
-            respLen += r;
-            respBuf[respLen] = '\0';
-            if (strstr(respBuf, "\r\n")) break;  // Got status line
-        } else if (r == 0) {
-            break;  // Connection closed
-        }
-        delay(50);
-    }
+        offset += payloadLen;
 
-    int httpCode = -1;
-    if (respLen > 0) {
-        respBuf[respLen] = '\0';
-        // Parse "HTTP/1.1 200 OK"
-        char* space = strchr(respBuf, ' ');
-        if (space) {
-            httpCode = atoi(space + 1);
+        // Progress every 20 chunks
+        if (i % 20 == 0) {
+            Serial.printf("[Network]   %u/%u chunks (%.0f%%)\n",
+                          i, totalChunks, 100.0 * i / totalChunks);
         }
-        Serial.printf("[Network] HTTP %d\n", httpCode);
-    } else {
-        Serial.println("[Network] No response (timeout)");
+
+        delay(2);  // Pace packets to avoid buffer overflow
+        yield();
     }
 
     lwip_close(sock);
-    return httpCode;
+    Serial.printf("[Network] UDP upload done: %u/%u chunks sent\n",
+                  chunksSent, totalChunks);
+    return chunksSent;
 }
 
 bool networkUploadWithRetry(camera_fb_t* fb, uint8_t frameSeq,
                             uint16_t batteryMV, uint8_t batteryPct) {
     for (int attempt = 0; attempt < UPLOAD_RETRIES; attempt++) {
         if (attempt > 0) {
-            int backoffMs = 1000 * (1 << (attempt - 1));
-            Serial.printf("[Network] Retry %d/%d in %d ms\n",
-                          attempt + 1, UPLOAD_RETRIES, backoffMs);
-            delay(backoffMs);
+            Serial.printf("[Network] Retry %d/%d\n", attempt + 1, UPLOAD_RETRIES);
+            delay(500);
         }
 
-        int code = networkUpload(fb, frameSeq, batteryMV, batteryPct);
-        if (code == 200) return true;
+        int sent = networkUpload(fb, frameSeq, batteryMV, batteryPct);
+        if (sent > 0) {
+            Serial.printf("[Network] Upload succeeded (%d chunks)\n", sent);
+            return true;
+        }
     }
     Serial.println("[Network] All upload attempts failed");
     return false;

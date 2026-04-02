@@ -26,17 +26,18 @@ int8_t networkRSSI();
 String networkSSID();
 
 /**
- * Upload a JPEG frame to the server over a fresh TCP connection.
+ * Upload a JPEG frame to the server via UDP datagrams.
+ * Protocol: 6-byte header [session_id:2][chunk_idx:2][total_chunks:2] + payload.
+ * Chunk 0 = JSON metadata, chunks 1..N = raw JPEG data.
  * Must be called AFTER WiFi is connected (networkConnect).
- * Returns HTTP status code (200 = success), or -1 on failure.
+ * Returns number of chunks sent, or -1 on failure.
  */
 int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
                   uint16_t batteryMV, uint8_t batteryPct);
 
 /**
- * Upload with retry logic (UPLOAD_RETRIES attempts, exponential backoff).
- * Opens a fresh TCP connection on each attempt.
- * Returns true if any attempt succeeded.
+ * Upload with retry logic (UPLOAD_RETRIES attempts).
+ * Returns true if any attempt sent all chunks.
  */
 bool networkUploadWithRetry(camera_fb_t* fb, uint8_t frameSeq,
                             uint16_t batteryMV, uint8_t batteryPct);

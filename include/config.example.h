@@ -23,6 +23,7 @@
 #define SERVER_PORT   8790
 #define SERVER_PATH   "/api/fridge/scan"
 #define SERVER_URL    "http://" SERVER_HOST ":8790" SERVER_PATH
+#define UDP_PORT      8791
 
 // Camera identity
 #define CAMERA_ID     "cam1"      // "cam1", "cam2", or "cam3"
