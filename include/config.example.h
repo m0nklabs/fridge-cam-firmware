@@ -19,7 +19,10 @@
 #define WIFI_PASSWORD_2 ""
 
 // Server endpoint (HungryFoodTool backend)
-#define SERVER_URL    "http://192.168.1.35:8790/api/fridge/scan"
+#define SERVER_HOST   "192.168.1.35"
+#define SERVER_PORT   8790
+#define SERVER_PATH   "/api/fridge/scan"
+#define SERVER_URL    "http://" SERVER_HOST ":8790" SERVER_PATH
 
 // Camera identity
 #define CAMERA_ID     "cam1"      // "cam1", "cam2", or "cam3"

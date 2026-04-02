@@ -119,7 +119,8 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         {"boot_count",   String(bootCount)},
         {"uptime_ms",    String(uptimeMs)},
         {"wake_reason",  String((int)wakeReason)},
-        {"fw_version",   "0.1.0"},
+        {"capture_ms",   String(uptimeMs)},
+        {"fw_version",   "0.1.1"},
         {"frame_width",  String(fb->width)},
         {"frame_height", String(fb->height)},
         {"frame_bytes",  String(fb->len)},
@@ -148,14 +149,14 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
 
     // Use raw WiFiClient for streaming upload (no malloc of full body)
     WiFiClient client;
-    if (!client.connect("192.168.1.26", 8790)) {
+    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
         Serial.println("[Network] Connection failed");
         return -1;
     }
 
     // Send HTTP request line + headers
-    client.printf("POST /api/fridge/scan HTTP/1.1\r\n");
-    client.printf("Host: 192.168.1.26:8790\r\n");
+    client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
+    client.printf("Host: %s:%d\r\n", SERVER_HOST, SERVER_PORT);
     client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
     client.printf("Content-Length: %u\r\n", totalLen);
     client.printf("Connection: close\r\n\r\n");
