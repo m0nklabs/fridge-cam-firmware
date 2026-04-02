@@ -153,7 +153,21 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     serverIP.fromString(SERVER_HOST);
 
     Serial.printf("[Network] Free heap: %u, PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
-    Serial.printf("[Network] WiFi status: %d, IP: %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+    Serial.printf("[Network] WiFi status: %d, IP: %s, GW: %s, DNS: %s\n",
+                  WiFi.status(), WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str());
+
+    // Diagnostic: try connecting to gateway first
+    WiFiClient gwTest;
+    IPAddress gwIP = WiFi.gatewayIP();
+    Serial.printf("[Network] Testing TCP to gateway %s:80...\n", gwIP.toString().c_str());
+    if (gwTest.connect(gwIP, 80, 3000)) {
+        Serial.println("[Network] Gateway TCP: OK");
+        gwTest.stop();
+    } else {
+        Serial.printf("[Network] Gateway TCP: FAILED (errno %d)\n", errno);
+    }
 
     if (!client.connect(serverIP, SERVER_PORT, 5000)) {
         Serial.printf("[Network] TCP connect to %s:%d failed (errno %d)\n",
