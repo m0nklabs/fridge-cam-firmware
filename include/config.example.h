@@ -7,9 +7,16 @@
 // config.h is gitignored — never commit credentials.
 // ============================================================
 
-// WiFi credentials
-#define WIFI_SSID     "your-ssid"
-#define WIFI_PASSWORD "your-password"
+// WiFi credentials (multiple APs — firmware picks strongest)
+#define WIFI_AP_COUNT 2
+
+// AP 1
+#define WIFI_SSID_1     "your-ssid"
+#define WIFI_PASSWORD_1 "your-password"
+
+// AP 2 (optional — set to "" to disable)
+#define WIFI_SSID_2     ""
+#define WIFI_PASSWORD_2 ""
 
 // Server endpoint (HungryFoodTool backend)
 #define SERVER_URL    "http://192.168.1.35:8790/api/fridge/scan"

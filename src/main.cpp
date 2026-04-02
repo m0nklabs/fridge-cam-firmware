@@ -8,65 +8,111 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include "config.h"
 #include "pins.h"
-
-// TODO: Implement these modules
-// #include "capture.h"    // Camera init, burst/stream capture
-// #include "network.h"    // WiFi connect, HTTP upload
-// #include "power.h"      // Battery ADC, deep sleep
+#include "trigger.h"
+#include "power.h"
+#include "capture.h"
+#include "network.h"
 
 RTC_DATA_ATTR uint32_t bootCount = 0;
 
+static void runBurstMode(uint16_t batteryMV, uint8_t batteryPct) {
+    camera_fb_t* best = captureBurst();
+    if (!best) {
+        Serial.println("[FridgeCam] Burst capture failed");
+        return;
+    }
+    networkUploadWithRetry(best, 0, batteryMV, batteryPct);
+    esp_camera_fb_return(best);
+}
+
+static void runStreamMode(uint16_t batteryMV, uint8_t batteryPct) {
+    int totalFrames = (STREAM_DURATION_S * 1000) / STREAM_INTERVAL_MS;
+    Serial.printf("[FridgeCam] Stream mode: %d frames over %d s\n",
+                  totalFrames, STREAM_DURATION_S);
+
+    for (int seq = 0; seq < totalFrames; seq++) {
+        camera_fb_t* fb = captureSingle();
+        if (fb) {
+            networkUploadWithRetry(fb, (uint8_t)seq, batteryMV, batteryPct);
+            esp_camera_fb_return(fb);
+        }
+        if (seq < totalFrames - 1) {
+            delay(STREAM_INTERVAL_MS);
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
+
+    // Wait for USB CDC serial to be ready (native USB needs time)
+    unsigned long serialStart = millis();
+    while (!Serial && (millis() - serialStart < 3000)) {
+        delay(10);
+    }
+    delay(500);  // Extra settle time
+
     bootCount++;
-    Serial.printf("[FridgeCam] Boot #%u, wake reason: %d\n",
-                  bootCount, esp_sleep_get_wakeup_cause());
+    esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
+    Serial.printf("\n[FridgeCam] ===== Boot #%u, wake reason: %d =====\n",
+                  bootCount, wakeReason);
+    Serial.printf("[FridgeCam] Free heap: %u, PSRAM: %u\n",
+                  ESP.getFreeHeap(), ESP.getFreePsram());
 
-    // TODO: Read battery voltage
-    // float batteryV = readBatteryVoltage();
-    // int batteryPct = voltageToPct(batteryV);
+    // 1. Init peripherals
+    triggerInit();
+    powerInit();
 
-    // TODO: Re-check LDR — confirm light is still on (debounce)
-    // int ldrValue = analogRead(PIN_LDR);
-    // if (ldrValue < LDR_THRESHOLD) {
-    //     Serial.println("[FridgeCam] False trigger, going back to sleep");
-    //     goToSleep();
-    //     return;
-    // }
+    // 2. Read battery
+    uint16_t batteryMV = powerReadVoltageMV();
+    uint8_t batteryPct = powerVoltageToPct(batteryMV);
+    Serial.printf("[FridgeCam] Battery: %u mV (%u%%)\n", batteryMV, batteryPct);
 
-    // TODO: Connect WiFi
-    // if (!connectWiFi(WIFI_SSID, WIFI_PASSWORD, WIFI_TIMEOUT_MS)) {
-    //     Serial.println("[FridgeCam] WiFi failed, sleeping");
-    //     goToSleep();
-    //     return;
-    // }
+    // 3. Re-check LDR — debounce false triggers
+    if (!triggerIsLightOn()) {
+        Serial.println("[FridgeCam] Light off — false trigger, sleeping");
+        powerDeepSleep();
+        return;
+    }
 
-    // TODO: Init camera
-    // if (!initCamera()) {
-    //     Serial.println("[FridgeCam] Camera init failed, sleeping");
-    //     goToSleep();
-    //     return;
-    // }
+    // 4. Connect WiFi (auto-selects strongest known AP)
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed, sleeping");
+        powerDeepSleep();
+        return;
+    }
 
-    // TODO: Capture + upload based on mode
-    // #if CAPTURE_MODE == BURST
-    //     captureAndUploadBurst();
-    // #else
-    //     captureAndUploadStream();
-    // #endif
+    // 5. Init camera
+    if (!captureInit()) {
+        Serial.println("[FridgeCam] Camera failed, sleeping");
+        networkDisconnect();
+        powerDeepSleep();
+        return;
+    }
 
-    // TODO: Deep sleep
-    // goToSleep();
+    // 6. Capture + upload
+    #if CAPTURE_MODE == CAPTURE_MODE_BURST
+        runBurstMode(batteryMV, batteryPct);
+    #elif CAPTURE_MODE == CAPTURE_MODE_STREAM
+        runStreamMode(batteryMV, batteryPct);
+    #endif
 
-    Serial.println("[FridgeCam] Firmware skeleton — implement capture modules");
-    Serial.println("[FridgeCam] Going to deep sleep in 5 seconds...");
-    delay(5000);
+    // 7. Cleanup and sleep
+    captureDeinit();
+    networkDisconnect();
 
-    // Configure ext0 wakeup on LDR pin (wake on HIGH = light detected)
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_LDR, 1);
-    esp_deep_sleep_start();
+    #if LDR_THRESHOLD == 0
+        // Testing mode: no LDR, don't deep sleep — reboot after delay
+        Serial.println("[FridgeCam] TEST MODE — sleeping 30s then reboot");
+        delay(30000);
+        ESP.restart();
+    #else
+        Serial.println("[FridgeCam] Done. Sleeping...");
+        powerDeepSleep();
+    #endif
 }
 
 void loop() {
