@@ -56,14 +56,24 @@ void setup() {
         return;
     }
 
-    // 4. Init camera (MUST happen before WiFi — DMA corrupts lwIP)
+    // 4. Connect WiFi FIRST — before camera GDMA corrupts the radio stack
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed (pre-camera), sleeping");
+        powerDeepSleep();
+        return;
+    }
+    Serial.printf("[FridgeCam] WiFi connected pre-camera: %s RSSI=%d\n",
+                  networkSSID().c_str(), networkRSSI());
+
+    // 5. Init camera (GDMA will partially corrupt lwIP, but WiFi stays connected)
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
+        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
-    // 5. Capture burst
+    // 6. Capture burst
     camera_fb_t* best = captureBurst();
     uint8_t* imgBuf = nullptr;
     size_t imgLen = 0;
@@ -80,46 +90,21 @@ void setup() {
         esp_camera_fb_return(best);
     }
 
-    // 6. Deinit camera (frees DMA channels)
+    // 7. Deinit camera (frees DMA channels)
     captureDeinit();
 
     if (!imgBuf) {
         Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
+        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
     Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
+    Serial.printf("[FridgeCam] WiFi still connected: %s (RSSI=%d)\n",
+                  WiFi.isConnected() ? "YES" : "NO", networkRSSI());
 
-    // 7. Force a complete WiFi/lwIP stack teardown and rebuild.
-    //    ESP32-S3 GDMA from camera corrupts the lwIP TCP task.
-    //    WiFi.begin() alone doesn't fix it — need to destroy the
-    //    entire esp_netif + WiFi driver and let Arduino rebuild it.
-    Serial.println("[FridgeCam] Destroying WiFi stack for clean rebuild...");
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    esp_wifi_stop();
-    esp_wifi_deinit();
-
-    // Destroy the default STA netif to force Arduino to recreate it
-    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta) {
-        esp_netif_destroy(sta);
-        Serial.println("[FridgeCam] Destroyed STA netif");
-    }
-    delay(200);
-
-    // Now let Arduino WiFi rebuild everything from scratch
-    Serial.println("[FridgeCam] Rebuilding WiFi stack...");
-
-    if (!networkConnect()) {
-        Serial.println("[FridgeCam] WiFi failed, sleeping");
-        free(imgBuf);
-        powerDeepSleep();
-        return;
-    }
-
-    // 8. Upload
+    // 8. Upload via UDP — WiFi was established before GDMA, should still TX
     camera_fb_t fakeFb;
     fakeFb.buf = imgBuf;
     fakeFb.len = imgLen;
