@@ -51,14 +51,31 @@ void setup() {
         return;
     }
 
-    // 4. Init camera + capture FIRST (camera PSRAM DMA conflicts with WiFi/lwIP)
-    if (!captureInit()) {
-        Serial.println("[FridgeCam] Camera failed, sleeping");
+    // 4. Connect WiFi FIRST (must happen before camera init)
+    //    Camera DMA permanently breaks TCP sockets on ESP32-S3.
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed, sleeping");
         powerDeepSleep();
         return;
     }
 
-    // 5. Capture burst (stores best JPEG in PSRAM, deinits camera)
+    // 5. Pre-open TCP socket to server (before camera DMA corrupts lwIP)
+    if (!networkPreConnect()) {
+        Serial.println("[FridgeCam] TCP pre-connect failed, sleeping");
+        networkDisconnect();
+        powerDeepSleep();
+        return;
+    }
+
+    // 6. Init camera (WARNING: this breaks new TCP sockets via GDMA)
+    if (!captureInit()) {
+        Serial.println("[FridgeCam] Camera failed, sleeping");
+        networkDisconnect();
+        powerDeepSleep();
+        return;
+    }
+
+    // 7. Capture burst
     camera_fb_t* best = captureBurst();
     uint8_t* imgBuf = nullptr;
     size_t imgLen = 0;
@@ -75,26 +92,19 @@ void setup() {
         esp_camera_fb_return(best);
     }
 
-    // 6. Deinit camera BEFORE WiFi (frees PSRAM DMA that conflicts with lwIP)
+    // 8. Deinit camera (frees DMA channels)
     captureDeinit();
 
     if (!imgBuf) {
         Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
+        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
-    Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes in PSRAM\n", imgW, imgH, imgLen);
+    Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
 
-    // 7. Connect WiFi (safe now — camera DMA released)
-    if (!networkConnect()) {
-        Serial.println("[FridgeCam] WiFi failed, sleeping");
-        free(imgBuf);
-        powerDeepSleep();
-        return;
-    }
-
-    // 8. Upload
+    // 9. Upload over pre-connected socket
     camera_fb_t fakeFb;
     fakeFb.buf = imgBuf;
     fakeFb.len = imgLen;
@@ -105,7 +115,7 @@ void setup() {
     networkUploadWithRetry(&fakeFb, 0, batteryMV, batteryPct);
     free(imgBuf);
 
-    // 9. Cleanup and sleep
+    // 10. Cleanup and sleep
     networkDisconnect();
 
     #if LDR_THRESHOLD == 0
