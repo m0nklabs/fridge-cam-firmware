@@ -56,24 +56,17 @@ void setup() {
         return;
     }
 
-    // 4. Connect WiFi FIRST — before camera GDMA corrupts the radio stack
-    if (!networkConnect()) {
-        Serial.println("[FridgeCam] WiFi failed (pre-camera), sleeping");
-        powerDeepSleep();
-        return;
-    }
-    Serial.printf("[FridgeCam] WiFi connected pre-camera: %s RSSI=%d\n",
-                  networkSSID().c_str(), networkRSSI());
-
-    // 5. Init camera (GDMA will partially corrupt lwIP, but WiFi stays connected)
+    // 4. Init camera FIRST (before WiFi)
+    //    GDMA from camera init corrupts shared DMA paths.
+    //    By doing camera first and WiFi after, the WiFi stack gets a
+    //    clean rebuild on a fresh netif that doesn't share DMA state.
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
-        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
-    // 6. Capture burst
+    // 5. Capture burst
     camera_fb_t* best = captureBurst();
     uint8_t* imgBuf = nullptr;
     size_t imgLen = 0;
@@ -90,21 +83,41 @@ void setup() {
         esp_camera_fb_return(best);
     }
 
-    // 7. Deinit camera (frees DMA channels)
+    // 6. Deinit camera (frees DMA channels)
     captureDeinit();
 
     if (!imgBuf) {
         Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
-        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
     Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
-    Serial.printf("[FridgeCam] WiFi still connected: %s (RSSI=%d)\n",
-                  WiFi.isConnected() ? "YES" : "NO", networkRSSI());
 
-    // 8. Upload via UDP — WiFi was established before GDMA, should still TX
+    // 7. Full WiFi + lwIP stack teardown and rebuild.
+    //    Critical: destroy STA netif so Arduino creates a FRESH one
+    //    that doesn't share any DMA state with the camera's GDMA paths.
+    Serial.println("[FridgeCam] Rebuilding WiFi stack (post-camera)...");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta) {
+        esp_netif_destroy(sta);
+        Serial.println("[FridgeCam] Destroyed STA netif");
+    }
+    delay(200);
+
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed, sleeping");
+        free(imgBuf);
+        powerDeepSleep();
+        return;
+    }
+
+    // 8. Upload via UDP
     camera_fb_t fakeFb;
     fakeFb.buf = imgBuf;
     fakeFb.len = imgLen;
