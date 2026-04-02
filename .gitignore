@@ -13,3 +13,4 @@ include/config.h
 # OS files
 .DS_Store
 Thumbs.db
+scratch/

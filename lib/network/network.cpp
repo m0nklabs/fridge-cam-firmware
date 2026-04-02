@@ -1,5 +1,6 @@
 #include "network.h"
 #include <WiFi.h>
+#include <HTTPClient.h>
 
 // Boot count from main.cpp (RTC_DATA_ATTR)
 extern RTC_DATA_ATTR uint32_t bootCount;
@@ -147,89 +148,48 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     Serial.printf("[Network] Uploading %u bytes (%u img) to %s\n",
                   totalLen, fb->len, SERVER_URL);
 
-    // Pre-connect diagnostics
-    Serial.printf("[Network] WiFi status: %d, IP: %s, GW: %s, DNS: %s\n",
-                  WiFi.status(),
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.gatewayIP().toString().c_str(),
-                  WiFi.dnsIP().toString().c_str());
+    // Use HTTPClient for proper connection handling (incl. ARP resolution)
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(UPLOAD_TIMEOUT_MS);
 
-    // Use raw WiFiClient for streaming upload (no malloc of full body)
-    WiFiClient client;
-    client.setTimeout(10);  // 10 second connect+write timeout
-
-    // Use IPAddress directly to bypass hostByName() which can fail silently
-    IPAddress serverIP;
-    serverIP.fromString(SERVER_HOST);
-    Serial.printf("[Network] Connecting to %s:%d (resolved: %s)...\n",
-                  SERVER_HOST, SERVER_PORT, serverIP.toString().c_str());
-    if (!client.connect(serverIP, SERVER_PORT)) {
-        Serial.printf("[Network] Connection failed (WiFi status: %d, errno: %d)\n",
-                      WiFi.status(), errno);
+    if (!http.begin(String("http://") + SERVER_HOST + ":" + String(SERVER_PORT) + SERVER_PATH)) {
+        Serial.println("[Network] HTTPClient begin failed");
         return -1;
     }
-    Serial.println("[Network] Connected OK");
 
-    // Send HTTP request line + headers
-    client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
-    client.printf("Host: %s:%d\r\n", SERVER_HOST, SERVER_PORT);
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-    client.printf("Content-Length: %u\r\n", totalLen);
-    client.printf("Connection: close\r\n\r\n");
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    http.addHeader("Content-Length", String(totalLen));
 
-    // Stream metadata
-    client.print(meta);
-
-    // Stream JPEG in chunks (4KB at a time to avoid memory issues)
-    size_t sent = 0;
-    const size_t chunkSize = 4096;
-    while (sent < fb->len) {
-        size_t toSend = fb->len - sent;
-        if (toSend > chunkSize) toSend = chunkSize;
-        size_t written = client.write(fb->buf + sent, toSend);
-        if (written == 0) {
-            Serial.println("[Network] Write failed mid-upload");
-            client.stop();
-            return -1;
-        }
-        sent += written;
+    // Build complete body in PSRAM (we have 8MB, body is ~125KB)
+    uint8_t* body = (uint8_t*)ps_malloc(totalLen);
+    if (!body) {
+        Serial.println("[Network] Failed to allocate upload buffer in PSRAM");
+        http.end();
+        return -1;
     }
 
-    // Send closing boundary
-    client.print(tail);
-    client.flush();
+    size_t offset = 0;
+    memcpy(body + offset, meta.c_str(), meta.length());
+    offset += meta.length();
+    memcpy(body + offset, fb->buf, fb->len);
+    offset += fb->len;
+    memcpy(body + offset, tail.c_str(), tail.length());
+    offset += tail.length();
 
-    // Read response
-    unsigned long t0 = millis();
-    while (!client.available() && (millis() - t0 < UPLOAD_TIMEOUT_MS)) {
-        delay(10);
-    }
+    Serial.printf("[Network] Sending %u bytes via HTTPClient...\n", offset);
+    int httpCode = http.sendRequest("POST", body, offset);
+    free(body);
 
-    int httpCode = -1;
-    if (client.available()) {
-        String statusLine = client.readStringUntil('\n');
-        // Parse "HTTP/1.1 200 OK"
-        int spaceIdx = statusLine.indexOf(' ');
-        if (spaceIdx > 0) {
-            httpCode = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
-        }
-        // Read body (skip headers)
-        String body;
-        bool headersEnded = false;
-        while (client.available()) {
-            String line = client.readStringUntil('\n');
-            if (!headersEnded && line.length() <= 2) {
-                headersEnded = true;
-                continue;
-            }
-            if (headersEnded) body += line;
-        }
-        Serial.printf("[Network] HTTP %d: %s\n", httpCode, body.c_str());
+    if (httpCode > 0) {
+        String response = http.getString();
+        Serial.printf("[Network] HTTP %d: %s\n", httpCode, response.c_str());
     } else {
-        Serial.println("[Network] No response (timeout)");
+        Serial.printf("[Network] HTTP error: %s (%d)\n",
+                      http.errorToString(httpCode).c_str(), httpCode);
     }
 
-    client.stop();
+    http.end();
     return httpCode;
 }
 
