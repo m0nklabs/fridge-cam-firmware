@@ -1,7 +1,6 @@
 #include "network.h"
 #include <WiFi.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
+#include <WiFiUdp.h>
 
 // Boot count from main.cpp (RTC_DATA_ATTR)
 extern RTC_DATA_ATTR uint32_t bootCount;
@@ -101,32 +100,20 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // UDP upload — bypasses broken lwIP TCP task after GDMA corruption.
+    // UDP upload via Arduino WiFiUDP — avoids raw lwIP socket issues post-GDMA.
     // Protocol: 6-byte header per packet + payload.
     // Chunk 0 = JSON metadata, chunks 1..N = raw JPEG data.
 
-    const int MAX_PAYLOAD = 1466;  // 1472 MTU - 6 byte header
+    const size_t MAX_PAYLOAD = 1466;  // 1472 MTU - 6 byte header
     const int HEADER_SIZE = 6;
 
-    // Create UDP socket
-    int sock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        Serial.printf("[Network] UDP socket() failed: %d\n", errno);
-        return -1;
-    }
-
-    struct sockaddr_in dest;
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(UDP_PORT);
+    WiFiUDP udp;
     IPAddress serverIP;
     serverIP.fromString(SERVER_HOST);
-    dest.sin_addr.s_addr = (uint32_t)serverIP;
 
-    // Random session ID to group packets
     uint16_t sessionId = (uint16_t)(esp_random() & 0xFFFF);
 
-    // Build JSON metadata for chunk 0
+    // Build JSON metadata
     int8_t rssi = WiFi.RSSI();
     char metaJson[512];
     int metaLen = snprintf(metaJson, sizeof(metaJson),
@@ -134,7 +121,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         "\"battery_mv\":%u,\"battery_pct\":%u,\"wifi_rssi\":%d,"
         "\"wifi_ssid\":\"%s\",\"free_heap\":%u,\"free_psram\":%u,"
         "\"boot_count\":%u,\"uptime_ms\":%lu,\"wake_reason\":%d,"
-        "\"fw_version\":\"0.2.0-udp\",\"frame_width\":%u,"
+        "\"fw_version\":\"0.2.1-wifiudp\",\"frame_width\":%u,"
         "\"frame_height\":%u,\"frame_bytes\":%u}",
         CAMERA_ID, ZONE, frameSeq,
         batteryMV, batteryPct, rssi,
@@ -142,87 +129,74 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         bootCount, millis(), (int)esp_sleep_get_wakeup_cause(),
         fb->width, fb->height, fb->len);
 
-    // Calculate total chunks: 1 (metadata) + ceil(jpeg_len / MAX_PAYLOAD)
     uint16_t jpegChunks = (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
     uint16_t totalChunks = 1 + jpegChunks;
 
     Serial.printf("[Network] UDP upload: session=0x%04X, %u bytes JPEG, %u chunks\n",
                   sessionId, fb->len, totalChunks);
 
-    // Packet buffer (header + payload)
-    uint8_t pkt[HEADER_SIZE + MAX_PAYLOAD];
-
-    // Helper to fill header
+    uint8_t header[HEADER_SIZE];
     auto fillHeader = [&](uint16_t chunkIdx) {
-        pkt[0] = (sessionId >> 8) & 0xFF;
-        pkt[1] = sessionId & 0xFF;
-        pkt[2] = (chunkIdx >> 8) & 0xFF;
-        pkt[3] = chunkIdx & 0xFF;
-        pkt[4] = (totalChunks >> 8) & 0xFF;
-        pkt[5] = totalChunks & 0xFF;
+        header[0] = (sessionId >> 8) & 0xFF;
+        header[1] = sessionId & 0xFF;
+        header[2] = (chunkIdx >> 8) & 0xFF;
+        header[3] = chunkIdx & 0xFF;
+        header[4] = (totalChunks >> 8) & 0xFF;
+        header[5] = totalChunks & 0xFF;
     };
 
     int chunksSent = 0;
+    unsigned long sendStart = millis();
 
-    // Send chunk 0: metadata JSON
+    // Send chunk 0: metadata
     fillHeader(0);
-    memcpy(pkt + HEADER_SIZE, metaJson, metaLen);
-    int sent = lwip_sendto(sock, pkt, HEADER_SIZE + metaLen, 0,
-                           (struct sockaddr*)&dest, sizeof(dest));
-    if (sent < 0) {
-        Serial.printf("[Network] UDP send meta failed: errno=%d\n", errno);
-        lwip_close(sock);
-        return -1;
+    if (udp.beginPacket(serverIP, UDP_PORT)) {
+        udp.write(header, HEADER_SIZE);
+        udp.write((uint8_t*)metaJson, metaLen);
+        if (udp.endPacket()) {
+            chunksSent++;
+        } else {
+            Serial.println("[Network] UDP meta endPacket failed");
+        }
     }
-    chunksSent++;
-    delay(10);  // Let metadata packet transmit before flooding
+    delay(15);
 
-    // Send chunks 1..N: JPEG data
+    // Send JPEG chunks
     size_t offset = 0;
     for (uint16_t i = 1; i < totalChunks; i++) {
         size_t payloadLen = fb->len - offset;
         if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
 
         fillHeader(i);
-        memcpy(pkt + HEADER_SIZE, fb->buf + offset, payloadLen);
 
-        // Retry on ENOMEM — lwIP pbufs need time to drain
-        int retries = 0;
-        while (true) {
-            sent = lwip_sendto(sock, pkt, HEADER_SIZE + payloadLen, 0,
-                               (struct sockaddr*)&dest, sizeof(dest));
-            if (sent >= 0) {
-                chunksSent++;
-                break;
+        // Retry on failure (ENOMEM / buffer full)
+        for (int retry = 0; retry < 20; retry++) {
+            if (udp.beginPacket(serverIP, UDP_PORT)) {
+                udp.write(header, HEADER_SIZE);
+                udp.write(fb->buf + offset, payloadLen);
+                if (udp.endPacket()) {
+                    chunksSent++;
+                    break;
+                }
             }
-            if (errno == ENOMEM && retries < 100) {
-                // Buffer full — wait for TX to drain, escalating delay
-                retries++;
-                delay(retries < 20 ? 20 : 50);
-                yield();
-            } else {
-                Serial.printf("[Network] UDP chunk %u failed: errno=%d (retries=%d)\n",
-                              i, errno, retries);
-                break;
-            }
+            // endPacket failed — wait for TX to drain
+            delay(25);
+            yield();
         }
 
         offset += payloadLen;
 
-        // Progress every 20 chunks
         if (i % 20 == 0) {
             Serial.printf("[Network]   %u/%u chunks (%.0f%%)\n",
                           i, totalChunks, 100.0 * i / totalChunks);
         }
 
-        // Pace: 10ms base + yield to let lwIP process TX
-        delay(10);
+        delay(15);
         yield();
     }
 
-    lwip_close(sock);
-    Serial.printf("[Network] UDP upload done: %u/%u chunks sent\n",
-                  chunksSent, totalChunks);
+    Serial.printf("[Network] UDP upload done: %u/%u chunks in %lu ms\n",
+                  chunksSent, totalChunks, millis() - sendStart);
     return chunksSent;
 }
 
