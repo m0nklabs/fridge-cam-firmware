@@ -195,10 +195,10 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
                 chunksSent++;
                 break;
             }
-            if (errno == ENOMEM && retries < 50) {
-                // Buffer full — wait for TX to drain
+            if (errno == ENOMEM && retries < 100) {
+                // Buffer full — wait for TX to drain, escalating delay
                 retries++;
-                delay(20);
+                delay(retries < 20 ? 20 : 50);
                 yield();
             } else {
                 Serial.printf("[Network] UDP chunk %u failed: errno=%d (retries=%d)\n",
