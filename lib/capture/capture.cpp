@@ -96,39 +96,36 @@ camera_fb_t* captureBurst() {
     Serial.printf("[Capture] Burst: %d frames, %d ms interval\n",
                   BURST_FRAMES, BURST_INTERVAL_MS);
 
-    camera_fb_t* frames[BURST_FRAMES] = {};
-    float sharpness[BURST_FRAMES] = {};
+    camera_fb_t* best = nullptr;
+    float bestSharp = -1.0f;
+    int bestIdx = -1;
+    int captured = 0;
 
     for (int i = 0; i < BURST_FRAMES; i++) {
-        frames[i] = captureSingle();
-        if (frames[i]) {
-            sharpness[i] = captureSharpness(frames[i]);
+        camera_fb_t* fb = captureSingle();
+        if (fb) {
+            captured++;
+            float sharp = captureSharpness(fb);
+            if (sharp > bestSharp) {
+                // New best — release previous best
+                if (best) esp_camera_fb_return(best);
+                best = fb;
+                bestSharp = sharp;
+                bestIdx = i;
+            } else {
+                // Not better — release immediately
+                esp_camera_fb_return(fb);
+            }
         }
         if (i < BURST_FRAMES - 1) {
             delay(BURST_INTERVAL_MS);
         }
     }
 
-    // Find sharpest
-    int bestIdx = 0;
-    float bestSharp = -1.0f;
-    for (int i = 0; i < BURST_FRAMES; i++) {
-        if (frames[i] && sharpness[i] > bestSharp) {
-            bestSharp = sharpness[i];
-            bestIdx = i;
-        }
-    }
+    Serial.printf("[Capture] Burst done: %d/%d captured, best=#%d (sharpness %.1f)\n",
+                  captured, BURST_FRAMES, bestIdx, bestSharp);
 
-    Serial.printf("[Capture] Best frame: #%d (sharpness %.1f)\n", bestIdx, bestSharp);
-
-    // Free non-best frames
-    for (int i = 0; i < BURST_FRAMES; i++) {
-        if (i != bestIdx && frames[i]) {
-            esp_camera_fb_return(frames[i]);
-        }
-    }
-
-    return frames[bestIdx];  // Caller must return this
+    return best;  // Caller must return this (nullptr if all failed)
 }
 
 void captureDeinit() {
