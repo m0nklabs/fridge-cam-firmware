@@ -52,11 +52,11 @@ bool networkConnect() {
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - start > WIFI_TIMEOUT_MS) {
-            Serial.println(" TIMEOUT");
+            Serial.printf(" TIMEOUT (status=%d)\n", WiFi.status());
             return false;
         }
-        delay(100);
-        Serial.print(".");
+        delay(250);
+        Serial.printf("[%d]", WiFi.status());
     }
     Serial.printf(" OK (%s, RSSI: %d dBm)\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());

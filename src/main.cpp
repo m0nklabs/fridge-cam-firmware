@@ -90,13 +90,11 @@ void setup() {
 
     Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
 
-    // 7. Full WiFi stack init AFTER camera is fully released.
-    //    ESP32-S3 GDMA from camera corrupts lwIP — only a fresh WiFi
-    //    init after camera deinit gives us working TCP sockets.
-    Serial.println("[FridgeCam] Starting WiFi stack (post-camera)...");
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    delay(100);
+    // 7. Connect WiFi AFTER camera is fully released.
+    //    WiFi was never started this boot, so no corrupted state to nuke.
+    //    Camera GDMA only corrupts an EXISTING lwIP stack — starting WiFi
+    //    fresh after camera deinit gives us clean TCP sockets.
+    Serial.println("[FridgeCam] Starting WiFi (post-camera)...");
 
     if (!networkConnect()) {
         Serial.println("[FridgeCam] WiFi failed, sleeping");
