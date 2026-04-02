@@ -24,8 +24,33 @@ static void runBurstMode(uint16_t batteryMV, uint8_t batteryPct) {
         Serial.println("[FridgeCam] Burst capture failed");
         return;
     }
-    networkUploadWithRetry(best, 0, batteryMV, batteryPct);
+
+    // Copy JPEG to PSRAM before camera deinit (deinit frees framebuffers)
+    size_t imgLen = best->len;
+    uint16_t imgW = best->width;
+    uint16_t imgH = best->height;
+    uint8_t* imgBuf = (uint8_t*)ps_malloc(imgLen);
+    if (!imgBuf) {
+        Serial.println("[FridgeCam] Failed to allocate PSRAM for image copy");
+        esp_camera_fb_return(best);
+        return;
+    }
+    memcpy(imgBuf, best->buf, imgLen);
     esp_camera_fb_return(best);
+
+    // Deinit camera to free DMA/PSRAM that conflicts with lwIP networking
+    captureDeinit();
+
+    // Build a minimal fake framebuffer for the upload function
+    camera_fb_t fakeFb;
+    fakeFb.buf = imgBuf;
+    fakeFb.len = imgLen;
+    fakeFb.width = imgW;
+    fakeFb.height = imgH;
+    fakeFb.format = PIXFORMAT_JPEG;
+
+    networkUploadWithRetry(&fakeFb, 0, batteryMV, batteryPct);
+    free(imgBuf);
 }
 
 static void runStreamMode(uint16_t batteryMV, uint8_t batteryPct) {
@@ -85,21 +110,6 @@ void setup() {
         return;
     }
 
-    // DEBUG: Test TCP before camera init
-    {
-        WiFiClient tc;
-        IPAddress srv;
-        srv.fromString(SERVER_HOST);
-        Serial.printf("[FridgeCam] TCP test BEFORE camera init → %s:%d ... ",
-                      SERVER_HOST, SERVER_PORT);
-        if (tc.connect(srv, SERVER_PORT, 5000)) {
-            Serial.println("OK ✓");
-            tc.stop();
-        } else {
-            Serial.printf("FAILED (errno %d)\n", errno);
-        }
-    }
-
     // 5. Init camera
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
@@ -109,14 +119,16 @@ void setup() {
     }
 
     // 6. Capture + upload
+    // NOTE: runBurstMode() calls captureDeinit() internally before upload
+    //       because camera PSRAM framebuffers corrupt the lwIP network stack.
     #if CAPTURE_MODE == CAPTURE_MODE_BURST
         runBurstMode(batteryMV, batteryPct);
     #elif CAPTURE_MODE == CAPTURE_MODE_STREAM
         runStreamMode(batteryMV, batteryPct);
+        captureDeinit();
     #endif
 
     // 7. Cleanup and sleep
-    captureDeinit();
     networkDisconnect();
 
     #if LDR_THRESHOLD == 0

@@ -96,37 +96,6 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // Wait for DHCP/network stack to fully settle
-    Serial.printf("[Network] Pre-upload: WiFi.status()=%d, IP=%s, subnet=%s, GW=%s\n",
-                  WiFi.status(),
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.subnetMask().toString().c_str(),
-                  WiFi.gatewayIP().toString().c_str());
-
-    // Give lwIP time to finish DHCP and ARP gratuitous
-    delay(1000);
-
-    // Test raw socket to gateway
-    WiFiClient testClient;
-    testClient.setTimeout(5);
-    IPAddress gw = WiFi.gatewayIP();
-    Serial.printf("[Network] TCP test → gateway %s:80 ... ", gw.toString().c_str());
-    if (testClient.connect(gw, 80, 5000)) {
-        Serial.println("OK");
-        testClient.stop();
-    } else {
-        Serial.printf("FAILED\n");
-        // Try again after 2s — ARP may resolve
-        delay(2000);
-        Serial.printf("[Network] TCP test → gateway (retry) ... ");
-        if (testClient.connect(gw, 80, 5000)) {
-            Serial.println("OK (after delay)");
-            testClient.stop();
-        } else {
-            Serial.printf("FAILED again\n");
-        }
-    }
-
     // Collect ESP stats
     int8_t rssi = WiFi.RSSI();
     uint32_t freeHeap = ESP.getFreeHeap();
