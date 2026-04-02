@@ -96,6 +96,27 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
+    // Connectivity check: try connecting to gateway port 80 to verify layer-3 works
+    WiFiClient testClient;
+    IPAddress gw = WiFi.gatewayIP();
+    Serial.printf("[Network] Connectivity check: gateway %s:80 ... ", gw.toString().c_str());
+    if (testClient.connect(gw, 80)) {
+        Serial.println("OK");
+        testClient.stop();
+    } else {
+        Serial.printf("FAILED (errno %d)\n", errno);
+    }
+    // Also try server IP directly
+    IPAddress serverIP;
+    serverIP.fromString(SERVER_HOST);
+    Serial.printf("[Network] Connectivity check: server %s:8790 ... ", SERVER_HOST);
+    if (testClient.connect(serverIP, SERVER_PORT)) {
+        Serial.println("OK");
+        testClient.stop();
+    } else {
+        Serial.printf("FAILED (errno %d)\n", errno);
+    }
+
     // Collect ESP stats
     int8_t rssi = WiFi.RSSI();
     uint32_t freeHeap = ESP.getFreeHeap();
