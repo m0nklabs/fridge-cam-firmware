@@ -158,9 +158,14 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     WiFiClient client;
     client.setTimeout(10);  // 10 second connect+write timeout
 
-    Serial.printf("[Network] Connecting to %s:%d...\n", SERVER_HOST, SERVER_PORT);
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.printf("[Network] Connection failed (WiFi status: %d)\n", WiFi.status());
+    // Use IPAddress directly to bypass hostByName() which can fail silently
+    IPAddress serverIP;
+    serverIP.fromString(SERVER_HOST);
+    Serial.printf("[Network] Connecting to %s:%d (resolved: %s)...\n",
+                  SERVER_HOST, SERVER_PORT, serverIP.toString().c_str());
+    if (!client.connect(serverIP, SERVER_PORT)) {
+        Serial.printf("[Network] Connection failed (WiFi status: %d, errno: %d)\n",
+                      WiFi.status(), errno);
         return -1;
     }
     Serial.println("[Network] Connected OK");
