@@ -13,6 +13,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include "config.h"
 #include "pins.h"
 #include "trigger.h"
@@ -90,11 +91,26 @@ void setup() {
 
     Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
 
-    // 7. Connect WiFi AFTER camera is fully released.
-    //    WiFi was never started this boot, so no corrupted state to nuke.
-    //    Camera GDMA only corrupts an EXISTING lwIP stack — starting WiFi
-    //    fresh after camera deinit gives us clean TCP sockets.
-    Serial.println("[FridgeCam] Starting WiFi (post-camera)...");
+    // 7. Force a complete WiFi/lwIP stack teardown and rebuild.
+    //    ESP32-S3 GDMA from camera corrupts the lwIP TCP task.
+    //    WiFi.begin() alone doesn't fix it — need to destroy the
+    //    entire esp_netif + WiFi driver and let Arduino rebuild it.
+    Serial.println("[FridgeCam] Destroying WiFi stack for clean rebuild...");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    // Destroy the default STA netif to force Arduino to recreate it
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta) {
+        esp_netif_destroy(sta);
+        Serial.println("[FridgeCam] Destroyed STA netif");
+    }
+    delay(200);
+
+    // Now let Arduino WiFi rebuild everything from scratch
+    Serial.println("[FridgeCam] Rebuilding WiFi stack...");
 
     if (!networkConnect()) {
         Serial.println("[FridgeCam] WiFi failed, sleeping");
