@@ -96,25 +96,35 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // Connectivity check: try connecting to gateway port 80 to verify layer-3 works
+    // Wait for DHCP/network stack to fully settle
+    Serial.printf("[Network] Pre-upload: WiFi.status()=%d, IP=%s, subnet=%s, GW=%s\n",
+                  WiFi.status(),
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.subnetMask().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str());
+
+    // Give lwIP time to finish DHCP and ARP gratuitous
+    delay(1000);
+
+    // Test raw socket to gateway
     WiFiClient testClient;
+    testClient.setTimeout(5);
     IPAddress gw = WiFi.gatewayIP();
-    Serial.printf("[Network] Connectivity check: gateway %s:80 ... ", gw.toString().c_str());
-    if (testClient.connect(gw, 80)) {
+    Serial.printf("[Network] TCP test → gateway %s:80 ... ", gw.toString().c_str());
+    if (testClient.connect(gw, 80, 5000)) {
         Serial.println("OK");
         testClient.stop();
     } else {
-        Serial.printf("FAILED (errno %d)\n", errno);
-    }
-    // Also try server IP directly
-    IPAddress serverIP;
-    serverIP.fromString(SERVER_HOST);
-    Serial.printf("[Network] Connectivity check: server %s:8790 ... ", SERVER_HOST);
-    if (testClient.connect(serverIP, SERVER_PORT)) {
-        Serial.println("OK");
-        testClient.stop();
-    } else {
-        Serial.printf("FAILED (errno %d)\n", errno);
+        Serial.printf("FAILED\n");
+        // Try again after 2s — ARP may resolve
+        delay(2000);
+        Serial.printf("[Network] TCP test → gateway (retry) ... ");
+        if (testClient.connect(gw, 80, 5000)) {
+            Serial.println("OK (after delay)");
+            testClient.stop();
+        } else {
+            Serial.printf("FAILED again\n");
+        }
     }
 
     // Collect ESP stats
