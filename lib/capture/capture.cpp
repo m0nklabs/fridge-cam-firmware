@@ -1,4 +1,7 @@
 #include "capture.h"
+#include "driver/periph_ctrl.h"
+#include "soc/periph_defs.h"
+#include "driver/gpio.h"
 
 bool captureInit() {
     camera_config_t config;
@@ -131,5 +134,17 @@ camera_fb_t* captureBurst() {
 
 void captureDeinit() {
     esp_camera_deinit();
-    Serial.println("[Capture] Camera deinitialized");
+
+    // CRITICAL: Disable LCD_CAM peripheral module after camera deinit.
+    // On ESP32-S3, esp_camera_deinit() leaves PERIPH_LCD_CAM_MODULE enabled,
+    // which keeps driving the 20MHz XCLK signal on the GPIO pin. This causes
+    // EMI cross-talk on the Freenove board's PCB traces that corrupts WiFi
+    // packet data in the TX DMA path.
+    // Fix confirmed by AxelLin (same board): github.com/espressif/esp32-camera/issues/662
+    periph_module_disable(PERIPH_LCD_CAM_MODULE);
+
+    // Disconnect XCLK pin from LCD_CAM output — stops driving the clock signal
+    gpio_reset_pin((gpio_num_t)CAM_PIN_XCLK);
+
+    Serial.println("[Capture] Camera deinitialized (LCD_CAM module disabled)");
 }

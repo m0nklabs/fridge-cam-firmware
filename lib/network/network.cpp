@@ -6,6 +6,11 @@
 // Boot count from main.cpp (RTC_DATA_ATTR)
 extern RTC_DATA_ATTR uint32_t bootCount;
 
+// Number of redundant send rounds (blast the same data multiple times)
+#ifndef UPLOAD_ROUNDS
+#define UPLOAD_ROUNDS 3
+#endif
+
 // Known AP list
 struct KnownAP {
     const char* ssid;
@@ -20,8 +25,23 @@ static const KnownAP knownAPs[] = {
 };
 static const int numKnownAPs = sizeof(knownAPs) / sizeof(knownAPs[0]);
 
+// CRC-16/CCITT (polynomial 0x1021, init 0xFFFF)
+// Supports chaining: pass previous CRC as init for multi-block computation
+static uint16_t crc16(const uint8_t* data, size_t len, uint16_t init = 0xFFFF) {
+    uint16_t crc = init;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
+
 bool networkConnect() {
-    // Try connecting up to 3 times with full WiFi reset between attempts
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) {
             Serial.printf("[Network] WiFi retry %d/3 — full radio reset\n", attempt + 1);
@@ -101,18 +121,15 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
 
-    // UDP upload via raw lwIP socket.
-    // Post-GDMA, lwIP pbufs are scarce. Strategy:
-    //   - Send ONE packet at a time
-    //   - Wait for ENOMEM to clear (=pbuf freed after actual TX)
-    //   - Use generous pacing to let radio actually transmit
-
-    const size_t MAX_PAYLOAD = 1400;  // Conservative: well under MTU
-    const int HEADER_SIZE = 6;
+    // BLAST MODE: send fast, no ENOMEM waits, multiple rounds.
+    // GDMA corruption is time-dependent — fast sends get more packets through.
+    // Header: [session:2][chunk:2][total:2][crc16:2] = 8 bytes
+    const size_t MAX_PAYLOAD = 1400;
+    const int HEADER_SIZE = 8;
 
     int sock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        Serial.printf("[Network] UDP socket() failed: %d\n", errno);
+        Serial.printf("[Network] socket() failed: %d\n", errno);
         return -1;
     }
 
@@ -126,18 +143,17 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
 
     uint16_t sessionId = (uint16_t)(esp_random() & 0xFFFF);
 
-    // Build metadata
-    int8_t rssi = WiFi.RSSI();
+    // Metadata JSON
     char metaJson[512];
     int metaLen = snprintf(metaJson, sizeof(metaJson),
         "{\"camera_id\":\"%s\",\"zone\":\"%s\",\"frame_seq\":%u,"
         "\"battery_mv\":%u,\"battery_pct\":%u,\"wifi_rssi\":%d,"
         "\"wifi_ssid\":\"%s\",\"free_heap\":%u,\"free_psram\":%u,"
         "\"boot_count\":%u,\"uptime_ms\":%lu,\"wake_reason\":%d,"
-        "\"fw_version\":\"0.2.2-slow\",\"frame_width\":%u,"
+        "\"fw_version\":\"0.3.0-blast\",\"frame_width\":%u,"
         "\"frame_height\":%u,\"frame_bytes\":%u}",
         CAMERA_ID, ZONE, frameSeq,
-        batteryMV, batteryPct, rssi,
+        batteryMV, batteryPct, (int)WiFi.RSSI(),
         WiFi.SSID().c_str(), ESP.getFreeHeap(), ESP.getFreePsram(),
         bootCount, millis(), (int)esp_sleep_get_wakeup_cause(),
         fb->width, fb->height, fb->len);
@@ -145,80 +161,86 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     uint16_t jpegChunks = (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
     uint16_t totalChunks = 1 + jpegChunks;
 
-    Serial.printf("[Network] UDP upload: session=0x%04X, %u bytes, %u chunks\n",
-                  sessionId, fb->len, totalChunks);
+    Serial.printf("[Network] UDP blast: session=0x%04X, %u bytes, %u chunks, %d rounds\n",
+                  sessionId, fb->len, totalChunks, UPLOAD_ROUNDS);
 
     uint8_t pkt[HEADER_SIZE + MAX_PAYLOAD];
-    auto fillHeader = [&](uint16_t chunkIdx) {
+
+    // Build header + compute CRC, then send.
+    // CRC covers: [session:2][chunk:2][total:2] + payload (excludes CRC field itself)
+    auto sendChunk = [&](uint16_t chunkIdx, const uint8_t* payload, size_t payloadLen) -> bool {
+        // Fill header (first 6 bytes)
         pkt[0] = (sessionId >> 8) & 0xFF;
         pkt[1] = sessionId & 0xFF;
         pkt[2] = (chunkIdx >> 8) & 0xFF;
         pkt[3] = chunkIdx & 0xFF;
         pkt[4] = (totalChunks >> 8) & 0xFF;
         pkt[5] = totalChunks & 0xFF;
+
+        // Copy payload after header area (at offset 8, CRC goes at 6-7)
+        memcpy(pkt + HEADER_SIZE, payload, payloadLen);
+
+        // CRC over header bytes 0-5 + payload (chained two-pass)
+        uint16_t c = crc16(pkt, 6);
+        c = crc16(payload, payloadLen, c);
+
+        // CRC into header bytes 6-7
+        pkt[6] = (c >> 8) & 0xFF;
+        pkt[7] = c & 0xFF;
+
+        int r = lwip_sendto(sock, pkt, HEADER_SIZE + payloadLen, 0,
+                            (struct sockaddr*)&dest, sizeof(dest));
+        return r >= 0;
     };
 
-    // Helper: send one packet with ENOMEM retry
-    auto sendPacket = [&](const uint8_t* data, size_t len) -> bool {
-        for (int retry = 0; retry < 200; retry++) {
-            int r = lwip_sendto(sock, data, len, 0,
-                                (struct sockaddr*)&dest, sizeof(dest));
-            if (r >= 0) return true;
-            if (errno != ENOMEM) return false;
-            // ENOMEM: radio hasn't TX'd the previous packet yet, wait
-            delay(25);
-            yield();
-        }
-        return false;  // 200 retries × 25ms = 5s patience per packet
-    };
-
-    int chunksSent = 0;
+    int totalSent = 0;
+    int totalFailed = 0;
     unsigned long sendStart = millis();
 
-    // Chunk 0: metadata
-    fillHeader(0);
-    memcpy(pkt + HEADER_SIZE, metaJson, metaLen);
-    if (sendPacket(pkt, HEADER_SIZE + metaLen)) {
-        chunksSent++;
-    } else {
-        Serial.printf("[Network] Failed to send metadata (errno=%d)\n", errno);
-        lwip_close(sock);
-        return -1;
-    }
-    yield();
-    delay(50);  // Give radio time to TX metadata
+    for (int round = 0; round < UPLOAD_ROUNDS; round++) {
+        int roundSent = 0;
+        int roundFail = 0;
 
-    // JPEG chunks
-    size_t offset = 0;
-    for (uint16_t i = 1; i < totalChunks; i++) {
-        size_t payloadLen = fb->len - offset;
-        if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
-
-        fillHeader(i);
-        memcpy(pkt + HEADER_SIZE, fb->buf + offset, payloadLen);
-
-        if (sendPacket(pkt, HEADER_SIZE + payloadLen)) {
-            chunksSent++;
+        // Chunk 0: metadata
+        if (sendChunk(0, (const uint8_t*)metaJson, metaLen)) {
+            roundSent++;
         } else {
-            Serial.printf("[Network] Chunk %u failed (errno=%d), continuing\n", i, errno);
+            roundFail++;
         }
 
-        offset += payloadLen;
+        // JPEG chunks — blast with no delay
+        size_t offset = 0;
+        for (uint16_t i = 1; i < totalChunks; i++) {
+            size_t payloadLen = fb->len - offset;
+            if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
 
-        if (i % 20 == 0) {
-            Serial.printf("[Network]   %u/%u chunks (%.0f%%)\n",
-                          i, totalChunks, 100.0 * i / totalChunks);
+            if (sendChunk(i, fb->buf + offset, payloadLen)) {
+                roundSent++;
+            } else {
+                roundFail++;
+                // On ENOMEM, yield once to let radio catch up, then continue
+                yield();
+            }
+
+            offset += payloadLen;
         }
 
+        totalSent += roundSent;
+        totalFailed += roundFail;
+        Serial.printf("[Network]   Round %d: %d/%u sent, %d ENOMEM\n",
+                      round + 1, roundSent, totalChunks, roundFail);
+
+        // Brief yield between rounds to let radio flush
         yield();
+        delay(10);
     }
 
     lwip_close(sock);
 
     unsigned long elapsed = millis() - sendStart;
-    Serial.printf("[Network] UDP done: %u/%u chunks in %lu ms\n",
-                  chunksSent, totalChunks, elapsed);
-    return chunksSent;
+    Serial.printf("[Network] Blast done: %d sent / %d failed in %lu ms\n",
+                  totalSent, totalFailed, elapsed);
+    return totalSent;
 }
 
 bool networkUploadWithRetry(camera_fb_t* fb, uint8_t frameSeq,
@@ -231,7 +253,8 @@ bool networkUploadWithRetry(camera_fb_t* fb, uint8_t frameSeq,
 
         int sent = networkUpload(fb, frameSeq, batteryMV, batteryPct);
         if (sent > 0) {
-            Serial.printf("[Network] Upload succeeded (%d chunks)\n", sent);
+            Serial.printf("[Network] Upload complete (%d packets across %d rounds)\n",
+                          sent, UPLOAD_ROUNDS);
             return true;
         }
     }

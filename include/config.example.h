@@ -57,8 +57,9 @@
 #define JPEG_QUALITY      10
 
 // Resolution
+// FRAMESIZE_VGA     = 640×480   (fast upload, fewer chunks — best for UDP blast)
 // FRAMESIZE_HD      = 1280×720  (good balance of quality/speed)
 // FRAMESIZE_SXGA    = 1280×1024
 // FRAMESIZE_UXGA    = 1600×1200 (max for reliable JPEG on 8MB PSRAM)
 // FRAMESIZE_QSXGA   = 2560×1920 (5MP full res — may be slow)
-#define CAMERA_RESOLUTION FRAMESIZE_UXGA
+#define CAMERA_RESOLUTION FRAMESIZE_VGA
