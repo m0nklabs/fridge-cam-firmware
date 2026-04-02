@@ -18,58 +18,6 @@
 
 RTC_DATA_ATTR uint32_t bootCount = 0;
 
-static void runBurstMode(uint16_t batteryMV, uint8_t batteryPct) {
-    camera_fb_t* best = captureBurst();
-    if (!best) {
-        Serial.println("[FridgeCam] Burst capture failed");
-        return;
-    }
-
-    // Copy JPEG to PSRAM before camera deinit (deinit frees framebuffers)
-    size_t imgLen = best->len;
-    uint16_t imgW = best->width;
-    uint16_t imgH = best->height;
-    uint8_t* imgBuf = (uint8_t*)ps_malloc(imgLen);
-    if (!imgBuf) {
-        Serial.println("[FridgeCam] Failed to allocate PSRAM for image copy");
-        esp_camera_fb_return(best);
-        return;
-    }
-    memcpy(imgBuf, best->buf, imgLen);
-    esp_camera_fb_return(best);
-
-    // Deinit camera to free DMA/PSRAM that conflicts with lwIP networking
-    captureDeinit();
-
-    // Build a minimal fake framebuffer for the upload function
-    camera_fb_t fakeFb;
-    fakeFb.buf = imgBuf;
-    fakeFb.len = imgLen;
-    fakeFb.width = imgW;
-    fakeFb.height = imgH;
-    fakeFb.format = PIXFORMAT_JPEG;
-
-    networkUploadWithRetry(&fakeFb, 0, batteryMV, batteryPct);
-    free(imgBuf);
-}
-
-static void runStreamMode(uint16_t batteryMV, uint8_t batteryPct) {
-    int totalFrames = (STREAM_DURATION_S * 1000) / STREAM_INTERVAL_MS;
-    Serial.printf("[FridgeCam] Stream mode: %d frames over %d s\n",
-                  totalFrames, STREAM_DURATION_S);
-
-    for (int seq = 0; seq < totalFrames; seq++) {
-        camera_fb_t* fb = captureSingle();
-        if (fb) {
-            networkUploadWithRetry(fb, (uint8_t)seq, batteryMV, batteryPct);
-            esp_camera_fb_return(fb);
-        }
-        if (seq < totalFrames - 1) {
-            delay(STREAM_INTERVAL_MS);
-        }
-    }
-}
-
 void setup() {
     Serial.begin(115200);
 
@@ -103,32 +51,61 @@ void setup() {
         return;
     }
 
-    // 4. Connect WiFi (auto-selects strongest known AP)
-    if (!networkConnect()) {
-        Serial.println("[FridgeCam] WiFi failed, sleeping");
-        powerDeepSleep();
-        return;
-    }
-
-    // 5. Init camera
+    // 4. Init camera + capture FIRST (camera PSRAM DMA conflicts with WiFi/lwIP)
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
-        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
-    // 6. Capture + upload
-    // NOTE: runBurstMode() calls captureDeinit() internally before upload
-    //       because camera PSRAM framebuffers corrupt the lwIP network stack.
-    #if CAPTURE_MODE == CAPTURE_MODE_BURST
-        runBurstMode(batteryMV, batteryPct);
-    #elif CAPTURE_MODE == CAPTURE_MODE_STREAM
-        runStreamMode(batteryMV, batteryPct);
-        captureDeinit();
-    #endif
+    // 5. Capture burst (stores best JPEG in PSRAM, deinits camera)
+    camera_fb_t* best = captureBurst();
+    uint8_t* imgBuf = nullptr;
+    size_t imgLen = 0;
+    uint16_t imgW = 0, imgH = 0;
 
-    // 7. Cleanup and sleep
+    if (best) {
+        imgLen = best->len;
+        imgW = best->width;
+        imgH = best->height;
+        imgBuf = (uint8_t*)ps_malloc(imgLen);
+        if (imgBuf) {
+            memcpy(imgBuf, best->buf, imgLen);
+        }
+        esp_camera_fb_return(best);
+    }
+
+    // 6. Deinit camera BEFORE WiFi (frees PSRAM DMA that conflicts with lwIP)
+    captureDeinit();
+
+    if (!imgBuf) {
+        Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
+        powerDeepSleep();
+        return;
+    }
+
+    Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes in PSRAM\n", imgW, imgH, imgLen);
+
+    // 7. Connect WiFi (safe now — camera DMA released)
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed, sleeping");
+        free(imgBuf);
+        powerDeepSleep();
+        return;
+    }
+
+    // 8. Upload
+    camera_fb_t fakeFb;
+    fakeFb.buf = imgBuf;
+    fakeFb.len = imgLen;
+    fakeFb.width = imgW;
+    fakeFb.height = imgH;
+    fakeFb.format = PIXFORMAT_JPEG;
+
+    networkUploadWithRetry(&fakeFb, 0, batteryMV, batteryPct);
+    free(imgBuf);
+
+    // 9. Cleanup and sleep
     networkDisconnect();
 
     #if LDR_THRESHOLD == 0
