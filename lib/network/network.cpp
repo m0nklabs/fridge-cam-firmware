@@ -147,12 +147,23 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     Serial.printf("[Network] Uploading %u bytes (%u img) to %s\n",
                   totalLen, fb->len, SERVER_URL);
 
+    // Pre-connect diagnostics
+    Serial.printf("[Network] WiFi status: %d, IP: %s, GW: %s, DNS: %s\n",
+                  WiFi.status(),
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str());
+
     // Use raw WiFiClient for streaming upload (no malloc of full body)
     WiFiClient client;
+    client.setTimeout(10);  // 10 second connect+write timeout
+
+    Serial.printf("[Network] Connecting to %s:%d...\n", SERVER_HOST, SERVER_PORT);
     if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.println("[Network] Connection failed");
+        Serial.printf("[Network] Connection failed (WiFi status: %d)\n", WiFi.status());
         return -1;
     }
+    Serial.println("[Network] Connected OK");
 
     // Send HTTP request line + headers
     client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
