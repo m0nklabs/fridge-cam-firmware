@@ -85,6 +85,21 @@ void setup() {
         return;
     }
 
+    // DEBUG: Test TCP before camera init
+    {
+        WiFiClient tc;
+        IPAddress srv;
+        srv.fromString(SERVER_HOST);
+        Serial.printf("[FridgeCam] TCP test BEFORE camera init → %s:%d ... ",
+                      SERVER_HOST, SERVER_PORT);
+        if (tc.connect(srv, SERVER_PORT, 5000)) {
+            Serial.println("OK ✓");
+            tc.stop();
+        } else {
+            Serial.printf("FAILED (errno %d)\n", errno);
+        }
+    }
+
     // 5. Init camera
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
