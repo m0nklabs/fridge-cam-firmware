@@ -151,8 +151,13 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     WiFiClient client;
     IPAddress serverIP;
     serverIP.fromString(SERVER_HOST);
+
+    Serial.printf("[Network] Free heap: %u, PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.printf("[Network] WiFi status: %d, IP: %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+
     if (!client.connect(serverIP, SERVER_PORT, 5000)) {
-        Serial.printf("[Network] TCP connect to %s:%d failed\n", SERVER_HOST, SERVER_PORT);
+        Serial.printf("[Network] TCP connect to %s:%d failed (errno %d)\n",
+                      SERVER_HOST, SERVER_PORT, errno);
         return -1;
     }
     Serial.println("[Network] TCP connected");

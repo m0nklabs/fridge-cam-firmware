@@ -24,13 +24,15 @@ bool captureInit() {
     config.pixel_format = PIXFORMAT_JPEG;
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
-    // Use PSRAM for framebuffer
+    // Use DRAM for framebuffer to avoid PSRAM DMA conflicts with WiFi/lwIP
+    // PSRAM DMA (CAMERA_FB_IN_PSRAM) corrupts the ESP32-S3 network stack.
+    // Trade-off: lower resolution but reliable uploads.
     if (psramFound()) {
-        config.frame_size   = CAMERA_RESOLUTION;
+        config.frame_size   = FRAMESIZE_VGA;   // 640x480
         config.jpeg_quality = JPEG_QUALITY;
-        config.fb_count     = 2;
-        config.fb_location  = CAMERA_FB_IN_PSRAM;
-        Serial.printf("[Capture] PSRAM found: %u bytes free\n", ESP.getFreePsram());
+        config.fb_count     = 1;
+        config.fb_location  = CAMERA_FB_IN_DRAM;
+        Serial.printf("[Capture] Using DRAM framebuffer (PSRAM DMA conflicts with WiFi)\n");
     } else {
         // Fallback without PSRAM — lower resolution
         config.frame_size   = FRAMESIZE_SVGA;
