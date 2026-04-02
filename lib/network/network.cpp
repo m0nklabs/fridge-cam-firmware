@@ -187,6 +187,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     size_t sent = 0;
     const size_t chunkSize = 4096;
     int stallCount = 0;
+    unsigned long sendStart = millis();
     while (sent < totalLen) {
         size_t toSend = totalLen - sent;
         if (toSend > chunkSize) toSend = chunkSize;
@@ -195,22 +196,27 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         if (written > 0) {
             sent += written;
             stallCount = 0;
-            // Give lwIP time to actually send the data and process ACKs
-            delay(50);
+            if (sent % 16384 < chunkSize) {
+                Serial.printf("[Network]   %u/%u bytes (%.0f%%)\n",
+                              sent, totalLen, 100.0 * sent / totalLen);
+            }
+            delay(25);
             yield();
         } else {
             stallCount++;
-            if (stallCount > 20) {  // 20 * 100ms = 2s stall
-                Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, totalLen);
+            if (stallCount > 40) {  // 40 * 50ms = 2s total stall
+                Serial.printf("[Network] Write stalled at %u/%u bytes after %lums\n",
+                              sent, totalLen, millis() - sendStart);
                 free(reqBuf);
                 client.stop();
                 return -1;
             }
-            delay(100);
+            delay(50);
             yield();
         }
     }
     free(reqBuf);
+    Serial.printf("[Network] Upload took %lu ms\n", millis() - sendStart);
 
     client.flush();
     Serial.printf("[Network] Sent %u bytes, waiting for response...\n", totalLen);
