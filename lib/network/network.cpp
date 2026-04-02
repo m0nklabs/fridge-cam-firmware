@@ -175,7 +175,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         return -1;
     }
     chunksSent++;
-    delay(2);  // Small gap to avoid overwhelming receiver
+    delay(10);  // Let metadata packet transmit before flooding
 
     // Send chunks 1..N: JPEG data
     size_t offset = 0;
@@ -186,13 +186,25 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
         fillHeader(i);
         memcpy(pkt + HEADER_SIZE, fb->buf + offset, payloadLen);
 
-        sent = lwip_sendto(sock, pkt, HEADER_SIZE + payloadLen, 0,
-                           (struct sockaddr*)&dest, sizeof(dest));
-        if (sent < 0) {
-            Serial.printf("[Network] UDP send chunk %u failed: errno=%d\n", i, errno);
-            // Continue — UDP is lossy, server can handle gaps
-        } else {
-            chunksSent++;
+        // Retry on ENOMEM — lwIP pbufs need time to drain
+        int retries = 0;
+        while (true) {
+            sent = lwip_sendto(sock, pkt, HEADER_SIZE + payloadLen, 0,
+                               (struct sockaddr*)&dest, sizeof(dest));
+            if (sent >= 0) {
+                chunksSent++;
+                break;
+            }
+            if (errno == ENOMEM && retries < 50) {
+                // Buffer full — wait for TX to drain
+                retries++;
+                delay(20);
+                yield();
+            } else {
+                Serial.printf("[Network] UDP chunk %u failed: errno=%d (retries=%d)\n",
+                              i, errno, retries);
+                break;
+            }
         }
 
         offset += payloadLen;
@@ -203,7 +215,8 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
                           i, totalChunks, 100.0 * i / totalChunks);
         }
 
-        delay(2);  // Pace packets to avoid buffer overflow
+        // Pace: 10ms base + yield to let lwIP process TX
+        delay(10);
         yield();
     }
 
