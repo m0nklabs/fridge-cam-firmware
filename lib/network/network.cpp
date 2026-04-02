@@ -18,10 +18,6 @@ static const KnownAP knownAPs[] = {
 };
 static const int numKnownAPs = sizeof(knownAPs) / sizeof(knownAPs[0]);
 
-// Pre-connected TCP socket (opened before camera init to survive DMA corruption)
-static WiFiClient preClient;
-static bool preConnected = false;
-
 bool networkConnect() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -68,10 +64,6 @@ bool networkConnect() {
 }
 
 void networkDisconnect() {
-    if (preConnected) {
-        preClient.stop();
-        preConnected = false;
-    }
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     Serial.println("[Network] WiFi off");
@@ -85,33 +77,26 @@ String networkSSID() {
     return WiFi.SSID();
 }
 
-bool networkPreConnect() {
-    IPAddress serverIP;
-    serverIP.fromString(SERVER_HOST);
-
-    Serial.printf("[Network] Pre-connecting TCP to %s:%d...\n", SERVER_HOST, SERVER_PORT);
-    if (!preClient.connect(serverIP, SERVER_PORT, 5000)) {
-        Serial.printf("[Network] Pre-connect failed (errno %d)\n", errno);
-        preConnected = false;
-        return false;
-    }
-
-    preConnected = true;
-    Serial.println("[Network] Pre-connect OK — socket held open for post-capture upload");
-    return true;
-}
-
-int networkUploadPreConnected(camera_fb_t* fb, uint8_t frameSeq,
-                              uint16_t batteryMV, uint8_t batteryPct) {
+int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
+                  uint16_t batteryMV, uint8_t batteryPct) {
     if (!fb || fb->len == 0) {
         Serial.println("[Network] No frame to upload");
         return -1;
     }
 
-    if (!preConnected || !preClient.connected()) {
-        Serial.println("[Network] Pre-connected socket lost");
+    // Open fresh TCP connection
+    WiFiClient client;
+    client.setNoDelay(true);
+
+    IPAddress serverIP;
+    serverIP.fromString(SERVER_HOST);
+
+    Serial.printf("[Network] Connecting TCP to %s:%d...\n", SERVER_HOST, SERVER_PORT);
+    if (!client.connect(serverIP, SERVER_PORT, 5000)) {
+        Serial.printf("[Network] TCP connect failed (errno %d)\n", errno);
         return -1;
     }
+    Serial.println("[Network] TCP connected");
 
     // Collect ESP stats
     int8_t rssi = WiFi.RSSI();
@@ -145,7 +130,7 @@ int networkUploadPreConnected(camera_fb_t* fb, uint8_t frameSeq,
     };
     int numFields = sizeof(fields) / sizeof(fields[0]);
 
-    // Pre-build metadata + image header
+    // Pre-build multipart body prefix (metadata + image header)
     String meta;
     meta.reserve(2048);
     for (int i = 0; i < numFields; i++) {
@@ -161,96 +146,85 @@ int networkUploadPreConnected(camera_fb_t* fb, uint8_t frameSeq,
     String tail = "\r\n--" + boundary + "--\r\n";
     size_t totalLen = meta.length() + fb->len + tail.length();
 
-    Serial.printf("[Network] Uploading %u bytes (%u img) over pre-connected socket\n",
-                  totalLen, fb->len);
+    Serial.printf("[Network] Uploading %u bytes (%u img)...\n", totalLen, fb->len);
 
-    // Send HTTP headers over pre-connected socket
-    preClient.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
-    preClient.printf("Host: %s:%d\r\n", SERVER_HOST, SERVER_PORT);
-    preClient.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-    preClient.printf("Content-Length: %u\r\n", totalLen);
-    preClient.print("Connection: close\r\n\r\n");
+    // Send HTTP headers
+    client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
+    client.printf("Host: %s:%d\r\n", SERVER_HOST, SERVER_PORT);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
+    client.printf("Content-Length: %u\r\n", totalLen);
+    client.print("Connection: close\r\n\r\n");
 
     // Send metadata
-    preClient.print(meta);
+    client.print(meta);
 
-    // Send image in small chunks
+    // Send image in chunks with flow control
     size_t sent = 0;
-    const size_t chunkSize = 256;
+    const size_t chunkSize = 1024;
     while (sent < fb->len) {
         size_t toSend = fb->len - sent;
         if (toSend > chunkSize) toSend = chunkSize;
-        size_t written = preClient.write(fb->buf + sent, toSend);
+
+        size_t written = client.write(fb->buf + sent, toSend);
         if (written == 0) {
-            // Give lwIP time to process ACKs and free TCP send buffer
-            for (int i = 0; i < 10; i++) {
-                delay(100);
-                yield();
-                written = preClient.write(fb->buf + sent, toSend);
-                if (written > 0) break;
-            }
+            // Brief wait for TCP send buffer to drain
+            delay(50);
+            yield();
+            written = client.write(fb->buf + sent, toSend);
         }
         if (written == 0) {
             Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, fb->len);
-            preClient.stop();
-            preConnected = false;
+            client.stop();
             return -1;
         }
         sent += written;
-        delay(1);  // Minimal delay between chunks for lwIP processing
         yield();
     }
 
     // Send closing boundary
-    preClient.print(tail);
-    preClient.flush();
+    client.print(tail);
+    client.flush();
 
     Serial.printf("[Network] Sent %u bytes, waiting for response...\n", totalLen);
 
     // Read response
     unsigned long respStart = millis();
-    while (!preClient.available() && millis() - respStart < UPLOAD_TIMEOUT_MS) {
+    while (!client.available() && millis() - respStart < UPLOAD_TIMEOUT_MS) {
         delay(10);
     }
 
     int httpCode = -1;
-    if (preClient.available()) {
-        String statusLine = preClient.readStringUntil('\n');
+    if (client.available()) {
+        String statusLine = client.readStringUntil('\n');
         int space1 = statusLine.indexOf(' ');
         if (space1 > 0) {
             httpCode = statusLine.substring(space1 + 1, space1 + 4).toInt();
         }
-        while (preClient.available()) {
-            preClient.read();
+        // Drain remaining response
+        while (client.available()) {
+            client.read();
         }
         Serial.printf("[Network] HTTP %d\n", httpCode);
     } else {
         Serial.println("[Network] No response (timeout)");
     }
 
-    preClient.stop();
-    preConnected = false;
+    client.stop();
     return httpCode;
 }
 
 bool networkUploadWithRetry(camera_fb_t* fb, uint8_t frameSeq,
                             uint16_t batteryMV, uint8_t batteryPct) {
-    // First attempt: use the pre-connected socket
-    int code = networkUploadPreConnected(fb, frameSeq, batteryMV, batteryPct);
-    if (code == 200) return true;
-
-    // Retries: try fresh connections (unlikely to work after camera DMA, but try)
-    for (int attempt = 1; attempt < UPLOAD_RETRIES; attempt++) {
-        int backoffMs = 1000 * (1 << (attempt - 1));
-        Serial.printf("[Network] Retry %d/%d in %d ms\n",
-                      attempt + 1, UPLOAD_RETRIES, backoffMs);
-        delay(backoffMs);
-
-        // Try to re-establish pre-connect
-        if (networkPreConnect()) {
-            code = networkUploadPreConnected(fb, frameSeq, batteryMV, batteryPct);
-            if (code == 200) return true;
+    for (int attempt = 0; attempt < UPLOAD_RETRIES; attempt++) {
+        if (attempt > 0) {
+            int backoffMs = 1000 * (1 << (attempt - 1));
+            Serial.printf("[Network] Retry %d/%d in %d ms\n",
+                          attempt + 1, UPLOAD_RETRIES, backoffMs);
+            delay(backoffMs);
         }
+
+        int code = networkUpload(fb, frameSeq, batteryMV, batteryPct);
+        if (code == 200) return true;
     }
     Serial.println("[Network] All upload attempts failed");
     return false;

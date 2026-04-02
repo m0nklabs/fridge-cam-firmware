@@ -4,11 +4,15 @@
  * Wake from deep sleep on LDR trigger → capture → upload → sleep.
  * Zero inference. All AI runs on the server.
  *
+ * CRITICAL: ESP32-S3 camera GDMA corrupts lwIP TCP stack.
+ * Workaround: full WiFi stack restart after camera deinit.
+ *
  * See docs/ARCHITECTURE.md for the full state machine.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "config.h"
 #include "pins.h"
 #include "trigger.h"
@@ -51,31 +55,14 @@ void setup() {
         return;
     }
 
-    // 4. Connect WiFi FIRST (must happen before camera init)
-    //    Camera DMA permanently breaks TCP sockets on ESP32-S3.
-    if (!networkConnect()) {
-        Serial.println("[FridgeCam] WiFi failed, sleeping");
-        powerDeepSleep();
-        return;
-    }
-
-    // 5. Pre-open TCP socket to server (before camera DMA corrupts lwIP)
-    if (!networkPreConnect()) {
-        Serial.println("[FridgeCam] TCP pre-connect failed, sleeping");
-        networkDisconnect();
-        powerDeepSleep();
-        return;
-    }
-
-    // 6. Init camera (WARNING: this breaks new TCP sockets via GDMA)
+    // 4. Init camera (MUST happen before WiFi — DMA corrupts lwIP)
     if (!captureInit()) {
         Serial.println("[FridgeCam] Camera failed, sleeping");
-        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
-    // 7. Capture burst
+    // 5. Capture burst
     camera_fb_t* best = captureBurst();
     uint8_t* imgBuf = nullptr;
     size_t imgLen = 0;
@@ -92,23 +79,33 @@ void setup() {
         esp_camera_fb_return(best);
     }
 
-    // 8. Deinit camera (frees DMA channels)
+    // 6. Deinit camera (frees DMA channels)
     captureDeinit();
-
-    // Give lwIP time to recover from GDMA interference
-    delay(500);
-    yield();
 
     if (!imgBuf) {
         Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
-        networkDisconnect();
         powerDeepSleep();
         return;
     }
 
     Serial.printf("[FridgeCam] Image ready: %ux%u, %u bytes\n", imgW, imgH, imgLen);
 
-    // 9. Upload over pre-connected socket
+    // 7. Full WiFi stack init AFTER camera is fully released.
+    //    ESP32-S3 GDMA from camera corrupts lwIP — only a fresh WiFi
+    //    init after camera deinit gives us working TCP sockets.
+    Serial.println("[FridgeCam] Starting WiFi stack (post-camera)...");
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    delay(100);
+
+    if (!networkConnect()) {
+        Serial.println("[FridgeCam] WiFi failed, sleeping");
+        free(imgBuf);
+        powerDeepSleep();
+        return;
+    }
+
+    // 8. Upload
     camera_fb_t fakeFb;
     fakeFb.buf = imgBuf;
     fakeFb.len = imgLen;
@@ -119,7 +116,7 @@ void setup() {
     networkUploadWithRetry(&fakeFb, 0, batteryMV, batteryPct);
     free(imgBuf);
 
-    // 10. Cleanup and sleep
+    // 9. Cleanup and sleep
     networkDisconnect();
 
     #if LDR_THRESHOLD == 0
