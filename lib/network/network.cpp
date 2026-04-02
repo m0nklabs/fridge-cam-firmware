@@ -112,6 +112,9 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     }
     Serial.println("[Network] TCP connected");
 
+    // Set short write timeout so we don't block forever when send buffer fills
+    client.setTimeout(2);
+
     // Collect ESP stats
     int8_t rssi = WiFi.RSSI();
     uint32_t freeHeap = ESP.getFreeHeap();
@@ -200,7 +203,7 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     // The GDMA corruption means lwIP's ACK handling is degraded —
     // give it generous time between writes to drain the send buffer.
     size_t sent = 0;
-    const size_t chunkSize = 4096;
+    const size_t chunkSize = 2048;
     int stallCount = 0;
     unsigned long sendStart = millis();
     while (sent < totalLen) {
@@ -215,18 +218,20 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
                 Serial.printf("[Network]   %u/%u bytes (%.0f%%)\n",
                               sent, totalLen, 100.0 * sent / totalLen);
             }
-            delay(25);
+            // Generous delay to let lwIP process ACKs
+            delay(100);
             yield();
         } else {
             stallCount++;
-            if (stallCount > 40) {  // 40 * 50ms = 2s total stall
+            if (stallCount > 100) {  // 100 * 200ms = 20s total stall
                 Serial.printf("[Network] Write stalled at %u/%u bytes after %lums\n",
                               sent, totalLen, millis() - sendStart);
                 free(reqBuf);
                 client.stop();
                 return -1;
             }
-            delay(50);
+            // Long delay to give lwIP maximum time to drain
+            delay(200);
             yield();
         }
     }
