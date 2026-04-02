@@ -147,9 +147,11 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     Serial.printf("[Network] Uploading %u bytes (%u img) to %s\n",
                   totalLen, fb->len, SERVER_URL);
 
-    // Direct TCP connection — no HTTPClient overhead
+    // Direct TCP connection — use IPAddress to skip DNS lookup
     WiFiClient client;
-    if (!client.connect(SERVER_HOST, SERVER_PORT, 5000)) {
+    IPAddress serverIP;
+    serverIP.fromString(SERVER_HOST);
+    if (!client.connect(serverIP, SERVER_PORT, 5000)) {
         Serial.printf("[Network] TCP connect to %s:%d failed\n", SERVER_HOST, SERVER_PORT);
         return -1;
     }
@@ -165,19 +167,25 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     // Send multipart metadata
     client.print(meta);
 
-    // Send image in small chunks
+    // Send image in small chunks with yield between them
     size_t sent = 0;
-    const size_t chunkSize = 1024;
+    const size_t chunkSize = 512;
     while (sent < fb->len) {
         size_t toSend = fb->len - sent;
         if (toSend > chunkSize) toSend = chunkSize;
         size_t written = client.write(fb->buf + sent, toSend);
+        if (written == 0) {
+            // Retry once after yielding
+            delay(10);
+            written = client.write(fb->buf + sent, toSend);
+        }
         if (written == 0) {
             Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, fb->len);
             client.stop();
             return -1;
         }
         sent += written;
+        yield();
     }
 
     // Send closing boundary
