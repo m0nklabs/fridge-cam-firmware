@@ -86,7 +86,6 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
 
     // Open fresh TCP connection
     WiFiClient client;
-    client.setNoDelay(true);
 
     IPAddress serverIP;
     serverIP.fromString(SERVER_HOST);
@@ -144,47 +143,55 @@ int networkUpload(camera_fb_t* fb, uint8_t frameSeq,
     meta += ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
 
     String tail = "\r\n--" + boundary + "--\r\n";
-    size_t totalLen = meta.length() + fb->len + tail.length();
+    size_t bodyLen = meta.length() + fb->len + tail.length();
 
-    Serial.printf("[Network] Uploading %u bytes (%u img)...\n", totalLen, fb->len);
+    // Build HTTP request line + headers
+    String headers;
+    headers.reserve(256);
+    headers += "POST ";
+    headers += SERVER_PATH;
+    headers += " HTTP/1.1\r\nHost: ";
+    headers += SERVER_HOST;
+    headers += ":";
+    headers += String(SERVER_PORT);
+    headers += "\r\nContent-Type: multipart/form-data; boundary=";
+    headers += boundary;
+    headers += "\r\nContent-Length: ";
+    headers += String(bodyLen);
+    headers += "\r\nConnection: close\r\n\r\n";
 
-    // Send HTTP headers
-    client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
-    client.printf("Host: %s:%d\r\n", SERVER_HOST, SERVER_PORT);
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-    client.printf("Content-Length: %u\r\n", totalLen);
-    client.print("Connection: close\r\n\r\n");
+    // Assemble ENTIRE HTTP request (headers + body) in one PSRAM buffer.
+    // This lets us do a single write() call — critical because the ESP32-S3
+    // GDMA corruption means lwIP can't process TCP ACKs between write calls.
+    size_t totalLen = headers.length() + bodyLen;
+    Serial.printf("[Network] Assembling %u byte request in PSRAM...\n", totalLen);
 
-    // Send metadata
-    client.print(meta);
-
-    // Send image in chunks with flow control
-    size_t sent = 0;
-    const size_t chunkSize = 1024;
-    while (sent < fb->len) {
-        size_t toSend = fb->len - sent;
-        if (toSend > chunkSize) toSend = chunkSize;
-
-        size_t written = client.write(fb->buf + sent, toSend);
-        if (written == 0) {
-            // Brief wait for TCP send buffer to drain
-            delay(50);
-            yield();
-            written = client.write(fb->buf + sent, toSend);
-        }
-        if (written == 0) {
-            Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, fb->len);
-            client.stop();
-            return -1;
-        }
-        sent += written;
-        yield();
+    uint8_t* reqBuf = (uint8_t*)ps_malloc(totalLen);
+    if (!reqBuf) {
+        Serial.println("[Network] PSRAM alloc failed for request buffer");
+        client.stop();
+        return -1;
     }
 
-    // Send closing boundary
-    client.print(tail);
-    client.flush();
+    size_t pos = 0;
+    memcpy(reqBuf + pos, headers.c_str(), headers.length()); pos += headers.length();
+    memcpy(reqBuf + pos, meta.c_str(), meta.length()); pos += meta.length();
+    memcpy(reqBuf + pos, fb->buf, fb->len); pos += fb->len;
+    memcpy(reqBuf + pos, tail.c_str(), tail.length()); pos += tail.length();
 
+    Serial.printf("[Network] Sending %u bytes in single write...\n", totalLen);
+
+    // Single write — pushes everything into the TCP send buffer at once
+    size_t written = client.write(reqBuf, totalLen);
+    free(reqBuf);
+
+    if (written != totalLen) {
+        Serial.printf("[Network] Write incomplete: %u/%u bytes\n", written, totalLen);
+        client.stop();
+        return -1;
+    }
+
+    client.flush();
     Serial.printf("[Network] Sent %u bytes, waiting for response...\n", totalLen);
 
     // Read response
