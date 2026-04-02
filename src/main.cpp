@@ -95,6 +95,10 @@ void setup() {
     // 8. Deinit camera (frees DMA channels)
     captureDeinit();
 
+    // Give lwIP time to recover from GDMA interference
+    delay(500);
+    yield();
+
     if (!imgBuf) {
         Serial.println("[FridgeCam] Capture failed or alloc failed, sleeping");
         networkDisconnect();

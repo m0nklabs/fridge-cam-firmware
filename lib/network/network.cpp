@@ -176,14 +176,19 @@ int networkUploadPreConnected(camera_fb_t* fb, uint8_t frameSeq,
 
     // Send image in small chunks
     size_t sent = 0;
-    const size_t chunkSize = 512;
+    const size_t chunkSize = 256;
     while (sent < fb->len) {
         size_t toSend = fb->len - sent;
         if (toSend > chunkSize) toSend = chunkSize;
         size_t written = preClient.write(fb->buf + sent, toSend);
         if (written == 0) {
-            delay(10);
-            written = preClient.write(fb->buf + sent, toSend);
+            // Give lwIP time to process ACKs and free TCP send buffer
+            for (int i = 0; i < 10; i++) {
+                delay(100);
+                yield();
+                written = preClient.write(fb->buf + sent, toSend);
+                if (written > 0) break;
+            }
         }
         if (written == 0) {
             Serial.printf("[Network] Write stalled at %u/%u bytes\n", sent, fb->len);
@@ -192,6 +197,7 @@ int networkUploadPreConnected(camera_fb_t* fb, uint8_t frameSeq,
             return -1;
         }
         sent += written;
+        delay(1);  // Minimal delay between chunks for lwIP processing
         yield();
     }
 
