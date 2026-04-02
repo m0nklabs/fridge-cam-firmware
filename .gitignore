@@ -1,0 +1,15 @@
+# PlatformIO build output
+.pio/
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Config with credentials
+include/config.h
+
+# OS files
+.DS_Store
+Thumbs.db
