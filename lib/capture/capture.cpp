@@ -23,7 +23,10 @@ bool captureInit() {
     config.pin_sccb_scl = CAM_PIN_SIOC;
     config.pin_pwdn     = CAM_PIN_PWDN;
     config.pin_reset    = CAM_PIN_RESET;
-    config.xclk_freq_hz = 20000000;
+    // 10MHz XCLK: Reduced from 20MHz to lower OPI PSRAM bus interference.
+    // 5MHz tested but no improvement on green line artifacts (hardware issue).
+    // See esp32-camera#172, #229, #827 for known OV5640+ESP32 noise issues.
+    config.xclk_freq_hz = 10000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
@@ -50,11 +53,22 @@ bool captureInit() {
         return false;
     }
 
-    // Warm up: discard first 2 frames (often garbage/green)
-    for (int i = 0; i < 2; i++) {
+    // --- OV5640 quality notes ---
+    // Green vertical line artifacts are a known HW issue on this board.
+    // Tested: XCLK 5/10/20MHz, H/V timing regs (#229), VCO fix (#827),
+    //         PSRAM in DRAM, fb_count 1/2 — none resolve it.
+    // Root cause: OPI PSRAM EMI + sensor module quality variance.
+    // Fix requires: decoupling cap on 3.3V or different OV5640 module.
+    sensor_t* s = esp_camera_sensor_get();
+    if (s && s->id.PID == OV5640_PID) {
+        Serial.println("[Capture] OV5640 detected (green line artifacts = known HW issue)");
+    }
+
+    // Warm up: discard first 4 frames (often garbage/green after init)
+    for (int i = 0; i < 4; i++) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb) esp_camera_fb_return(fb);
-        delay(100);
+        delay(200);
     }
 
     Serial.println("[Capture] Camera initialized OK");
