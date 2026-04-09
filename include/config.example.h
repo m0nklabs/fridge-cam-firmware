@@ -25,41 +25,57 @@
 #define SERVER_URL    "http://" SERVER_HOST ":8790" SERVER_PATH
 #define UDP_PORT      8791
 
-// Camera identity
-#define CAMERA_ID     "cam1"      // "cam1", "cam2", or "cam3"
-#define ZONE          "fridge"    // "fridge" or "freezer"
-
-// Camera mode
-// BURST = capture 3 frames, upload sharpest (CAM 1 + CAM 2)
-// STREAM = capture every 2s for 30s, upload all (CAM 3)
-#define CAPTURE_MODE  BURST       // BURST or STREAM
+// Camera identity (single ceiling cam for intake scanning)
+#define CAMERA_ID     "cam1"
+#define ZONE          "fridge"
 
 // LDR trigger threshold (12-bit ADC, 0-4095)
 // ~620 = ~0.5V = typical light-on threshold for GL5528 + 10kΩ divider
+// Set to 0 for testing without LDR (captures on every boot)
 #define LDR_THRESHOLD 620
 
 // Upload retry config
-#define UPLOAD_RETRIES    3       // Number of retry attempts
+#define UPLOAD_RETRIES    3       // Number of retry attempts per file
 #define UPLOAD_TIMEOUT_MS 10000   // Per-attempt timeout (ms)
 
 // WiFi connection timeout (ms)
 #define WIFI_TIMEOUT_MS   5000
 
-// Burst mode config
-#define BURST_FRAMES      3       // Number of frames to capture
-#define BURST_INTERVAL_MS 2000    // Delay between frames (ms)
+// --- Capture Settings (Intake Scan Mode) ---
+// Rapid continuous capture while door is open.
+// Frames buffered to SD card, uploaded after door closes.
 
-// Stream mode config (CAM 3 only)
-#define STREAM_DURATION_S 30      // Total stream time (seconds)
-#define STREAM_INTERVAL_MS 2000   // Delay between frames (ms)
+// Interval between captures (ms) — lower = more frames, more SD writes
+// 500ms = 2 fps — good balance of coverage vs storage
+#define CAPTURE_INTERVAL_MS  500
+
+// Maximum frames per session (safety cap — prevents filling SD)
+#define MAX_FRAMES_PER_SESSION 120  // 60 seconds at 2fps
+
+// Maximum upload batch (files per upload phase)
+// If more files exist, remaining are uploaded on next boot
+#define MAX_UPLOAD_BATCH  60
+
+// LDR re-check interval during capture (ms)
+// How often to check if the fridge light turned off (door closed)
+#define LDR_CHECK_INTERVAL_MS  250
+
+// Grace period after light off before ending capture (ms)
+// Prevents premature stop from hand blocking the light briefly
+#define LIGHT_OFF_GRACE_MS  1500
 
 // JPEG quality (0-63, lower = better quality, larger file)
+// 10 = high quality (~50-80KB at VGA), good for label reading
 #define JPEG_QUALITY      10
 
 // Resolution
-// FRAMESIZE_VGA     = 640×480   (fast upload, fewer chunks — best for UDP blast)
-// FRAMESIZE_HD      = 1280×720  (good balance of quality/speed)
-// FRAMESIZE_SXGA    = 1280×1024
-// FRAMESIZE_UXGA    = 1600×1200 (max for reliable JPEG on 8MB PSRAM)
-// FRAMESIZE_QSXGA   = 2560×1920 (5MP full res — may be slow)
-#define CAMERA_RESOLUTION FRAMESIZE_VGA
+// FRAMESIZE_VGA     = 640×480   (fast SD write, ~40-60KB per frame)
+// FRAMESIZE_HD      = 1280×720  (better label detail, ~100-150KB)
+// FRAMESIZE_SXGA    = 1280×1024 (high detail, ~150-200KB)
+// FRAMESIZE_UXGA    = 1600×1200 (max quality, ~200-300KB)
+// For packaging label reading, HD is recommended.
+#define CAMERA_RESOLUTION FRAMESIZE_HD
+
+// --- Legacy Burst Settings (kept for reference) ---
+#define BURST_FRAMES      3
+#define BURST_INTERVAL_MS 2000

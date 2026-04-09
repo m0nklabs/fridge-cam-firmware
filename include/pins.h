@@ -22,3 +22,10 @@
 // Freenove board: GPIO48 = onboard RGB LED
 // Other boards: wire an external LED + 220Ω resistor
 #define PIN_STATUS_LED   48
+
+// SD card SPI pins (Freenove ESP32-S3-WROOM CAM board)
+// These are separate from camera DVP pins — no conflict.
+#define PIN_SD_CS        21
+#define PIN_SD_MOSI      38
+#define PIN_SD_MISO      40
+#define PIN_SD_SCK       39

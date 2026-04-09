@@ -1,203 +1,186 @@
 # Firmware Architecture
 
-How the ESP32 firmware works — state machine, capture pipeline, upload protocol, and power management.
+How the ESP32 firmware works — state machine, capture pipeline, SD buffering, upload protocol, and power management.
+
+## Design: Intake Scan
+
+Single ceiling-mounted camera at the front of the fridge, looking down at the opening. Captures packaging labels as items go in/out — one product at a time, clean shots, well-lit (door is open).
+
+**Why intake over inventory?**
+- Cleaner captures: single item in frame vs cluttered shelves
+- Labels face up/forward when placing items
+- Vision LLM gets high-quality label shots
+- Simpler hardware: 1 camera instead of 3
+- IN vs OUT inferrable from frame sequence + context
 
 ## State Machine
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────┐     LDR interrupt      ┌──────────────────┐  │
-│  │          │ ──────────────────────▶ │                  │  │
-│  │  DEEP    │                        │  BOOT + INIT     │  │
-│  │  SLEEP   │ ◀────────────────────  │  (~200ms)        │  │
-│  │  ~10µA   │     upload done /      │  - WiFi connect  │  │
-│  │          │     timeout / error    │  - Camera init   │  │
-│  └──────────┘                        │  - Read battery  │  │
-│                                      └────────┬─────────┘  │
-│                                               │             │
-│                                               ▼             │
-│                           ┌──────────────────────────────┐  │
-│                           │                              │  │
-│                           │  CAPTURE                     │  │
-│                           │                              │  │
-│                           │  Burst mode (CAM 1/2):       │  │
-│                           │    3 frames @ t=1s,3s,5s     │  │
-│                           │    Select sharpest            │  │
-│                           │                              │  │
-│                           │  Stream mode (CAM 3):        │  │
-│                           │    1 frame/2s for 30s        │  │
-│                           │    Upload each immediately   │  │
-│                           │                              │  │
-│                           └──────────────┬───────────────┘  │
-│                                          │                  │
-│                                          ▼                  │
-│                           ┌──────────────────────────────┐  │
-│                           │                              │  │
-│                           │  UPLOAD                      │  │
-│                           │                              │  │
-│                           │  HTTP POST multipart/form    │  │
-│                           │  to /api/fridge/scan         │  │
-│                           │  Retry 3× with backoff       │  │
-│                           │  Timeout: 10s per attempt    │  │
-│                           │                              │  │
-│                           └──────────────────────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                                                               │
+│  ┌──────────┐     LDR interrupt      ┌────────────────────┐  │
+│  │          │ ──────────────────────▶ │                    │  │
+│  │  DEEP    │                        │  BOOT + INIT       │  │
+│  │  SLEEP   │ ◀───── all done ─────  │  (~500ms)          │  │
+│  │  ~10µA   │                        │  - Read battery    │  │
+│  │          │                        │  - LDR debounce    │  │
+│  └──────────┘                        └────────┬───────────┘  │
+│       ▲                                       │              │
+│       │                                       ▼              │
+│       │              ┌────────────────────────────────────┐  │
+│       │              │                                    │  │
+│       │              │  CAPTURE PHASE                     │  │
+│       │              │  (camera + SD active, WiFi off)    │  │
+│       │              │                                    │  │
+│       │              │  while (light on):                 │  │
+│       │              │    capture frame → write to SD     │  │
+│       │              │    ~500ms interval (2 fps)         │  │
+│       │              │    max 120 frames safety cap       │  │
+│       │              │                                    │  │
+│       │              │  light off + grace period → stop   │  │
+│       │              │  deinit camera (free GDMA)         │  │
+│       │              │                                    │  │
+│       │              └──────────────┬─────────────────────┘  │
+│       │                             │                        │
+│       │                             ▼                        │
+│       │              ┌────────────────────────────────────┐  │
+│       │              │                                    │  │
+│       │              │  UPLOAD PHASE                      │  │
+│       │              │  (WiFi active, camera off)         │  │
+│       │              │                                    │  │
+│       │              │  rebuild WiFi stack (clean DMA)    │  │
+│       │              │  for each file on SD:              │  │
+│       │              │    read → UDP blast → delete       │  │
+│       │              │  max 60 files per batch            │  │
+│       │              │                                    │  │
+│       │              │  if light came back on → restart   │  │
+│       │              │                                    │  │
+│       └──────────────┴────────────────────────────────────┘  │
+│                                                               │
+│  BONUS: On false trigger (light off at boot), check for      │
+│  orphaned SD files from interrupted previous sessions         │
+│  and upload those before sleeping.                            │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## Boot Sequence
 
 1. **Wake from deep sleep** — ext0 wakeup on LDR GPIO (rising edge)
-2. **Initialise peripherals** (~50ms):
-   - Camera: configure OV5640 (JPEG mode, 1280×720 or 1600×1200)
-   - ADC: read battery voltage
-   - GPIO: set up LDR pin, status LED
-3. **Connect WiFi** (~100-500ms):
-   - Use saved credentials from NVS
-   - Static IP preferred (faster than DHCP)
-   - Timeout: 5 seconds → abort and sleep if no connection
-4. **LDR re-check** — confirm light is still on (debounce false triggers)
-   - If dark again → back to sleep immediately (door was opened briefly)
-5. **Enter capture mode**
+2. **Read battery voltage** (~10ms)
+3. **LDR re-check** — confirm light is still on
+   - If dark → check SD for orphaned files → upload if any → sleep
+4. **Enter capture phase**
 
-## Capture Logic
+## Capture Phase
 
-### Burst Mode (CAM 1 + CAM 2)
+Camera and SD card are active. WiFi is OFF (GDMA conflict).
 
-```cpp
-// Capture 3 frames with 2-second intervals
-for (int i = 0; i < 3; i++) {
-    frames[i] = capture_jpeg();
-    sharpness[i] = laplacian_variance(frames[i]);
-    delay(2000);
-}
-// Select frame with highest sharpness score
-best = argmax(sharpness);
-upload(frames[best]);
+```
+camera init → SD init → capture loop → camera deinit
 ```
 
-**Why 3 frames?**
-- Frame 1: Door just opened, things may be moving
-- Frame 2: Stable view, items settled
-- Frame 3: User may have grabbed/placed items
-- Sharpest = least motion blur = best for vision LLM
-
-### Stream Mode (CAM 3)
+### Continuous Capture Loop
 
 ```cpp
-// Continuous capture for 30 seconds
-for (int seq = 0; seq < 15; seq++) {
-    frame = capture_jpeg();
-    upload(frame, seq);   // Upload immediately
-    delay(2000);
+while (frameCount < MAX_FRAMES && lightIsOn()) {
+    frame = captureJPEG();           // ~50ms at HD
+    storageWriteFrame(frame, sd);    // ~30ms SPI write
+    releaseFrame(frame);
+    wait(CAPTURE_INTERVAL_MS);       // 500ms default
 }
 ```
 
-**Why stream?** The freezer has drawers that open sequentially over 10-20 seconds. Continuous capture catches each drawer as it's pulled out.
+**Timing per frame:**
+- Camera capture: ~50ms (HD JPEG, PSRAM framebuffer)
+- SD SPI write: ~30-50ms (HD frame ~100-150KB at ~3MB/s)
+- Overhead: ~10ms
+- **Total: ~110ms per frame** — well within 500ms interval
 
-### Frame Selection (Burst Mode)
+### Light-Off Detection
 
-Sharpness via Laplacian variance — done on the ESP32 before upload:
+LDR is checked every 250ms during the capture loop. When light goes off:
+1. Start grace timer (1.5s default)
+2. If light comes back within grace → ignore (hand blocked sensor)
+3. If light stays off → end capture phase
 
-```cpp
-float laplacian_variance(camera_fb_t* fb) {
-    // Decode JPEG to grayscale (or use Y channel)
-    // Apply 3×3 Laplacian kernel
-    // Return variance of result — higher = sharper
-}
+### Frame Budget
+
+At HD (1280×720), JPEG quality 10:
+- ~100-150KB per frame
+- At 2 fps over 30s door open = 60 frames = ~6-9MB
+- Typical 8GB SD card = hundreds of sessions before full
+- Safety cap: 120 frames max per session
+
+## SD Card Buffering
+
+**Why SD instead of upload-during-capture?**
+The ESP32-S3 has a known GDMA conflict between camera and WiFi DMA.
+Camera and WiFi cannot be active simultaneously. SD card uses SPI (no DMA conflict).
+
+**File layout:**
+```
+/fc_000042_001.jpg    ← session 42, frame 1
+/fc_000042_002.jpg    ← session 42, frame 2
+...
 ```
 
-This avoids uploading blurry frames and saves bandwidth + server processing.
+**Persistence benefit:** If power is lost during upload or WiFi fails,
+frames survive on SD and are uploaded on the next boot (orphan recovery).
 
-## Upload Protocol
+## Upload Phase
 
-### HTTP Request
+Camera is deinitialized. WiFi stack is rebuilt from scratch (clean DMA state).
 
 ```
-POST /api/fridge/scan HTTP/1.1
-Host: 192.168.1.35:8790
-Content-Type: multipart/form-data; boundary=----FridgeCam
-
-------FridgeCam
-Content-Disposition: form-data; name="image"; filename="cam1_20260402T143022.jpg"
-Content-Type: image/jpeg
-
-<JPEG binary data>
-------FridgeCam
-Content-Disposition: form-data; name="camera_id"
-
-cam1
-------FridgeCam
-Content-Disposition: form-data; name="zone"
-
-fridge
-------FridgeCam
-Content-Disposition: form-data; name="battery_mv"
-
-3850
-------FridgeCam
-Content-Disposition: form-data; name="battery_pct"
-
-72
-------FridgeCam
-Content-Disposition: form-data; name="timestamp"
-
-2026-04-02T14:30:22Z
-------FridgeCam--
+camera deinit → WiFi rebuild → connect → upload files → disconnect
 ```
 
-### Server Response
+### Upload Protocol (unchanged — UDP Blast)
 
-```json
-{
-  "status": "ok",
-  "scan_id": "abc123",
-  "items_detected": 12
-}
-```
+Per file: read from SD → UDP blast with 3 redundancy rounds.
+See `lib/network/` for the chunked UDP protocol with CRC16.
 
-### Retry Logic
+### Batch Limit
 
-- 3 attempts with exponential backoff (1s, 2s, 4s)
-- Timeout per attempt: 10 seconds
-- If all 3 fail → log error, go to sleep (try again next door open)
-- Never block indefinitely — battery life is sacred
+Max 60 files per upload phase. If more exist (from multiple sessions),
+remaining files are uploaded on the next boot. This prevents
+excessively long upload phases that drain battery.
 
-## Power Management
+### Post-Upload Light Check
 
-### Deep Sleep Configuration
+After upload completes, LDR is checked one more time.
+If light came back on (door reopened during upload) → restart the cycle.
 
-```cpp
-esp_sleep_enable_ext0_wakeup(LDR_GPIO, 1);  // Wake on HIGH (light detected)
-esp_deep_sleep_start();
-```
-
-### Power Budget
+## Power Budget
 
 | Phase | Duration | Current | Energy |
 |-------|----------|---------|--------|
 | Deep sleep | ~hours | ~10µA | negligible |
-| Boot + WiFi | ~500ms | ~240mA | 0.033 mAh |
-| Capture (burst) | ~5s | ~240mA | 0.33 mAh |
-| Upload | ~1-2s | ~240mA | 0.13 mAh |
-| **Total per event** | **~6s active** | | **~0.4 mAh** |
+| Boot + init | ~500ms | ~240mA | 0.033 mAh |
+| Capture (30s) | ~30s | ~280mA | 2.33 mAh |
+| SD write (incl.) | (overlaps capture) | +20mA | (included) |
+| Upload (60 frames) | ~20-40s | ~240mA | 2.0 mAh |
+| **Total per event** | **~60s active** | | **~4.4 mAh** |
 
-With 6000mAh battery (2× 18650 parallel) and ~20 door opens/day:
-- Daily: 20 × 0.4 mAh = 8 mAh + deep sleep ~2.4 mAh = **~10.4 mAh/day**
-- Battery life: 6000 / 10.4 = **~577 days** (conservative estimate)
+With 6000mAh battery and ~10 door opens/day:
+- Daily: 10 × 4.4 mAh + deep sleep ~2.4 mAh = **~46.4 mAh/day**
+- Battery life: 6000 / 46.4 = **~129 days** (~4.3 months)
 
-### Battery Reporting
+More active sessions use more power. For 20 opens/day: ~64 days.
+Still very practical for USB-C rechargeable setup.
 
-Every upload includes `battery_mv` and `battery_pct`. The server stores this per camera and triggers warnings in the HFT frontend when batteries run low.
+## GDMA Workaround (unchanged)
 
-## NVS Storage
+ESP32-S3 camera uses LCD_CAM peripheral GDMA which corrupts WiFi TX DMA buffers.
+The two-phase architecture (capture→upload) avoids this entirely:
 
-Non-volatile storage for persistent config:
+1. Camera phase: camera GDMA active, no WiFi
+2. `captureDeinit()` → `periph_module_disable(PERIPH_LCD_CAM_MODULE)` + GPIO reset
+3. WiFi phase: full WiFi stack rebuild on clean DMA state
 
-| Key | Type | Purpose |
-|-----|------|--------|
-| `wifi_ssid` | string | WiFi network name |
+This is actually cleaner than the old single-shot design because there's
+never a moment where both peripherals compete for DMA resources.
 | `wifi_pass` | string | WiFi password |
 | `server_url` | string | Upload endpoint URL |
 | `camera_id` | string | This unit's ID (cam1/cam2/cam3) |
