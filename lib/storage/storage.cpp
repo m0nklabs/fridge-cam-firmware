@@ -1,19 +1,24 @@
 #include "storage.h"
 #include "pins.h"
-#include <SPI.h>
-#include <SD.h>
+#include <SD_MMC.h>
 
 static bool sdReady = false;
 
-bool storageInit() {
-    SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+// Freenove ESP32-S3-WROOM SDMMC pins (from official Sketch_04.1_SDMMC_Test)
+#define SD_MMC_CMD  38
+#define SD_MMC_CLK  39
+#define SD_MMC_D0   40
 
-    if (!SD.begin(PIN_SD_CS)) {
+bool storageInit() {
+    SD_MMC.setPins(SD_MMC_CLK, SD_MMC_CMD, SD_MMC_D0);
+
+    // 1-bit mode, format if mount fails, default freq
+    if (!SD_MMC.begin("/sdcard", true, true, SDMMC_FREQ_DEFAULT, 5)) {
         Serial.println("[Storage] SD card init FAILED");
         return false;
     }
 
-    uint8_t cardType = SD.cardType();
+    uint8_t cardType = SD_MMC.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("[Storage] No SD card detected");
         return false;
@@ -24,8 +29,8 @@ bool storageInit() {
     else if (cardType == CARD_SD) typeStr = "SD";
     else if (cardType == CARD_SDHC) typeStr = "SDHC";
 
-    uint64_t totalMB = SD.totalBytes() / (1024 * 1024);
-    uint64_t usedMB = SD.usedBytes() / (1024 * 1024);
+    uint64_t totalMB = SD_MMC.totalBytes() / (1024 * 1024);
+    uint64_t usedMB = SD_MMC.usedBytes() / (1024 * 1024);
     Serial.printf("[Storage] SD card: %s, %llu MB total, %llu MB used\n",
                   typeStr, totalMB, usedMB);
 
@@ -35,8 +40,7 @@ bool storageInit() {
 
 void storageDeinit() {
     if (sdReady) {
-        SD.end();
-        SPI.end();
+        SD_MMC.end();
         sdReady = false;
         Serial.println("[Storage] SD card released");
     }
@@ -54,7 +58,7 @@ String storageWriteBuffer(const uint8_t* buf, size_t len, uint32_t session, uint
     snprintf(filename, sizeof(filename), "/fc_%06lu_%03u.jpg", session, seq);
 
     unsigned long writeStart = millis();
-    File file = SD.open(filename, FILE_WRITE);
+    File file = SD_MMC.open(filename, FILE_WRITE);
     if (!file) {
         Serial.printf("[Storage] Failed to open %s for writing\n", filename);
         return "";
@@ -68,7 +72,7 @@ String storageWriteBuffer(const uint8_t* buf, size_t len, uint32_t session, uint
     if (written != len) {
         Serial.printf("[Storage] Write incomplete: %u/%u bytes to %s\n",
                       written, len, filename);
-        SD.remove(filename);
+        SD_MMC.remove(filename);
         return "";
     }
 
@@ -80,7 +84,7 @@ String storageWriteBuffer(const uint8_t* buf, size_t len, uint32_t session, uint
 int storageListPending(String* filenames, int maxFiles) {
     if (!sdReady) return 0;
 
-    File root = SD.open("/");
+    File root = SD_MMC.open("/");
     if (!root || !root.isDirectory()) return 0;
 
     int count = 0;
@@ -113,7 +117,7 @@ uint8_t* storageReadFile(const String& filename, size_t* outLen) {
     if (!sdReady || !outLen) return nullptr;
     *outLen = 0;
 
-    File file = SD.open(filename, FILE_READ);
+    File file = SD_MMC.open(filename, FILE_READ);
     if (!file) {
         Serial.printf("[Storage] Failed to open %s for reading\n", filename.c_str());
         return nullptr;
@@ -149,7 +153,7 @@ uint8_t* storageReadFile(const String& filename, size_t* outLen) {
 bool storageDeleteFile(const String& filename) {
     if (!sdReady) return false;
 
-    if (SD.remove(filename.c_str())) {
+    if (SD_MMC.remove(filename.c_str())) {
         Serial.printf("[Storage] Deleted %s\n", filename.c_str());
         return true;
     }
@@ -160,7 +164,7 @@ bool storageDeleteFile(const String& filename) {
 int storagePendingCount() {
     if (!sdReady) return 0;
 
-    File root = SD.open("/");
+    File root = SD_MMC.open("/");
     if (!root || !root.isDirectory()) return 0;
 
     int count = 0;
@@ -182,6 +186,6 @@ void storageGetInfo(uint64_t* totalBytes, uint64_t* usedBytes) {
         *usedBytes = 0;
         return;
     }
-    *totalBytes = SD.totalBytes();
-    *usedBytes = SD.usedBytes();
+    *totalBytes = SD_MMC.totalBytes();
+    *usedBytes = SD_MMC.usedBytes();
 }

@@ -7,6 +7,10 @@
 /**
  * SD card buffered storage for fridge cam frames.
  *
+ * Uses SDMMC 1-bit mode on Freenove ESP32-S3-WROOM board:
+ *   CMD = GPIO 38, CLK = GPIO 39, D0 = GPIO 40
+ * Per official Freenove Sketch_04.1_SDMMC_Test pinout.
+ *
  * Frames are written to SD during capture (camera active, WiFi off).
  * After capture, files are read back for upload (WiFi active, camera off).
  * This decouples capture speed from upload speed and survives power loss.
@@ -18,7 +22,7 @@
  */
 
 /**
- * Initialize SD card via SPI.
+ * Initialize SD card via SDMMC 1-bit mode.
  * Returns true on success.
  */
 bool storageInit();
