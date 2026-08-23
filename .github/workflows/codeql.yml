@@ -1,0 +1,15 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  codeql:
+    uses: m0nklabs/github-action-runners/.github/workflows/codeql-detect.yml@main
+    secrets: inherit
