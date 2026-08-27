@@ -27,6 +27,7 @@ jobs:
       enable_tier2: true
       auto_describe: true
       auto_improve: true
+      single_call_review: true  # EXPERIMENTEEL: 1 modelcall review+suggesties (fork); terugdraaien: false
       response_language: en-US
     secrets:
       GUARDIAN_API_KEY: ${{ secrets.GUARDIAN_API_KEY }}
