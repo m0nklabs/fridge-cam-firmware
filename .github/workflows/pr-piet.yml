@@ -12,9 +12,11 @@ permissions:
   issues: write
   pull-requests: write
 
-# Eén review tegelijk per PR: nieuwe run cancelt de lopende.
+# Eén commando-review tegelijk per PR: comments ZONDER commando (bot-audits)
+# krijgen een unieke groep zodat ze de lopende review NIET cancellen.
 concurrency:
-  group: pr-piet-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    pr-piet-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}${{ github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/') && format('-nc-{0}', github.event.comment.id) || '' }}
   cancel-in-progress: true
 
 jobs:
